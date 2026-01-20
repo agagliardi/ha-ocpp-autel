@@ -1,1 +1,169 @@
+# Configurazione Unificata OCPP con Modulazione Dinamica (Power Balancing)
+# Utilizza ocpp.set_charge_rate con notazione puramente YAML
+# Identificativo wallbox: "charger" (dev_id)
 
+input_number:
+  # Slider per la potenza DESIDERATA (kW)
+  ev_charging_power_kw:
+    name: "Potenza di Ricarica Target (kW)"
+    initial: 3.7
+    min: 0
+    max: 6
+    step: 0.1
+    unit_of_measurement: kW
+    icon: mdi:gauge
+
+  # Configurazione del limite massimo dello slider
+  ev_max_power_config_kw:
+    name: "Limite Massimo Configurato (kW)"
+    initial: 6
+    min: 1.4
+    max: 6
+    step: 0.1
+    unit_of_measurement: kW
+    icon: mdi:shield-check
+
+input_boolean:
+  # Switch per attivare/disattivare il bilanciamento dinamico
+  ev_dynamic_balancing_enabled:
+    name: "Modulazione Carico Dinamica"
+    initial: false
+    icon: mdi:scale-balance
+
+input_button:
+  # Reset manuale profili
+  ev_reset_ocpp_profiles:
+    name: "Reset Profili OCPP"
+    icon: mdi:refresh
+
+automation:
+  # --- AUTOMAZIONE 1: LIMITE TARGET (STACK 1) ---
+  # Imposta il limite scelto manualmente dall'utente nel TxDefaultProfile
+  - alias: "EV - Imposta Target TxDefaultProfile"
+    id: ev_set_target_default_profile
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: input_number.ev_charging_power_kw
+    action:
+      - variables:
+          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(0) }}"
+          target_amps: "{{ ((target_kw * 1000) / 230) | round(1) }}"
+          effective_limit: "{{ target_amps if target_amps >= 6 else 0 }}"
+          trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: >
+            [TxDefault] Impostazione target: {{ target_kw }}kW ({{ target_amps }}A). 
+            TransactionId: {{ trans_id }}. Limite applicato: {{ effective_limit }}A.
+
+      - service: ocpp.set_charge_rate
+        data:
+          conn_id: 1
+          custom_profile:
+            transactionId: "{{ trans_id }}"
+            chargingProfileId: 1
+            stackLevel: 1
+            chargingProfilePurpose: "TxDefaultProfile"
+            chargingProfileKind: "Relative"
+            chargingSchedule:
+              chargingRateUnit: "A"
+              chargingSchedulePeriod:
+                - startPeriod: 0
+                  limit: "{{ effective_limit }}"
+
+  # --- AUTOMAZIONE 2: MODULAZIONE DINAMICA (STACK 2) ---
+  # Sovrascrive lo stack 1 basandosi sulla disponibilità dell'inverter
+  # AGGIORNAMENTO: Throttling di 30 secondi per non stressare l'auto
+  - alias: "EV - Modulazione Dinamica TxProfile"
+    id: ev_modulate_tx_profile
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: sensor.inverter_grid_power
+      - platform: state
+        entity_id: input_boolean.ev_dynamic_balancing_enabled
+    condition:
+      # Condizione 1: Modulazione abilitata da UI
+      - condition: state
+        entity_id: input_boolean.ev_dynamic_balancing_enabled
+        state: "on"
+      # Condizione 2: Carica effettivamente in corso (Transaction ID > 0)
+      - condition: template
+        value_template: "{{ states('sensor.charger_transaction_id') | int(0) > 0 }}"
+    action:
+      - variables:
+          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(0) }}"
+          trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+          # sensor.inverter_grid_power: positivo = immissione, negativo = prelievo
+          grid_power_kw: "{{ states('sensor.inverter_grid_power') | float(0) / 1000 }}"
+          available_kw: "{{ target_kw + grid_power_kw }}"
+          final_kw: "{{ [available_kw, target_kw] | min | float(0) }}"
+          calculated_amps: "{{ (final_kw * 1000) / 230 }}"
+          effective_limit: "{{ calculated_amps | round(1) if calculated_amps >= 6 else 0 }}"
+
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_modulation
+          message: >
+            [Modulazione] Grid: {{ grid_power_kw | round(2) }}kW | Disp: {{ available_kw | round(2) }}kW 
+            -> Applicato: {{ final_kw | round(2) }}kW ({{ calculated_amps | round(1) }}A). TxID: {{ trans_id }}
+
+      - service: ocpp.set_charge_rate
+        data:
+          conn_id: 1
+          custom_profile:
+            transactionId: "{{ trans_id }}"
+            chargingProfileId: 2
+            stackLevel: 2
+            chargingProfilePurpose: "TxProfile"
+            chargingProfileKind: "Relative"
+            chargingSchedule:
+              chargingRateUnit: "A"
+              chargingSchedulePeriod:
+                - startPeriod: 0
+                  limit: "{{ effective_limit }}"
+      
+      # Attesa di 30 secondi per evitare modulazioni troppo frequenti (Throttling)
+      - delay: "00:00:30"
+
+  # --- AUTOMAZIONE 3: SINCRONIZZAZIONE LIMITI UI ---
+  - alias: "EV - Sincronizza Massimo Slider"
+    id: ev_sync_max_slider_kw
+    trigger:
+      - platform: state
+        entity_id: input_number.ev_max_power_config_kw
+    action:
+      - service: input_number.set_limit
+        target:
+          entity_id: input_number.ev_charging_power_kw
+        data:
+          max: "{{ states('input_number.ev_max_power_config_kw') | float(6.0) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.ev_charging_power_kw
+        data:
+          value: >
+            {% set current = states('input_number.ev_charging_power_kw') | float(0) %}
+            {% set max_val = states('input_number.ev_max_power_config_kw') | float(6.0) %}
+            {{ current if current <= max_val else max_val }}
+
+  # --- AUTOMAZIONE 4: RESET ---
+  - alias: "EV - Reset Profili OCPP"
+    id: ev_reset_ocpp_profiles
+    trigger:
+      - platform: state
+        entity_id: input_button.ev_reset_ocpp_profiles
+    action:
+      - service: system_log.write
+        data:
+          level: warning
+          logger: ocpp_automation
+          message: "Reset manuale dei profili OCPP per il dispositivo 'charger'."
+      - service: ocpp.clear_profile
+        data:
+          dev_id: "charger"
