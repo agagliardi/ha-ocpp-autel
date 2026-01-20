@@ -3,23 +3,25 @@
 # Identificativo wallbox: "charger" (dev_id)
 
 input_number:
-  # Slider per la potenza DESIDERATA (kW)
+  # Valore numerico per la potenza DESIDERATA (kW) - Modalità BOX per inserimento tastiera
   ev_charging_power_kw:
     name: "Potenza di Ricarica Target (kW)"
     initial: 3.7
     min: 0
     max: 6
     step: 0.1
+    mode: box
     unit_of_measurement: kW
     icon: mdi:gauge
 
-  # Configurazione del limite massimo dello slider
+  # Configurazione del limite massimo - Modalità BOX
   ev_max_power_config_kw:
     name: "Limite Massimo Configurato (kW)"
     initial: 6
     min: 1.4
     max: 6
     step: 0.1
+    mode: box
     unit_of_measurement: kW
     icon: mdi:shield-check
 
@@ -31,14 +33,14 @@ input_boolean:
     icon: mdi:scale-balance
 
 input_button:
-  # Reset manuale profili
+  # Pulsante per il reset manuale dei profili
   ev_reset_ocpp_profiles:
     name: "Reset Profili OCPP"
     icon: mdi:refresh
 
 automation:
   # --- AUTOMAZIONE 1: LIMITE TARGET (STACK 1) ---
-  # Imposta il limite scelto manualmente dall'utente nel TxDefaultProfile
+  # Imposta il limite scelto manualmente nel TxDefaultProfile
   - alias: "EV - Imposta Target TxDefaultProfile"
     id: ev_set_target_default_profile
     mode: restart
@@ -77,7 +79,7 @@ automation:
 
   # --- AUTOMAZIONE 2: MODULAZIONE DINAMICA (STACK 2) ---
   # Sovrascrive lo stack 1 basandosi sulla disponibilità dell'inverter
-  # AGGIORNAMENTO: Throttling di 30 secondi per non stressare l'auto
+  # Throttling di 30 secondi per non stressare l'auto (Ioniq 5)
   - alias: "EV - Modulazione Dinamica TxProfile"
     id: ev_modulate_tx_profile
     mode: restart
@@ -128,21 +130,15 @@ automation:
                 - startPeriod: 0
                   limit: "{{ effective_limit }}"
       
-      # Attesa di 30 secondi per evitare modulazioni troppo frequenti (Throttling)
       - delay: "00:00:30"
 
-  # --- AUTOMAZIONE 3: SINCRONIZZAZIONE LIMITI UI ---
-  - alias: "EV - Sincronizza Massimo Slider"
-    id: ev_sync_max_slider_kw
+  # --- AUTOMAZIONE 3: VALIDAZIONE MASSIMO ---
+  - alias: "EV - Valida Massimo Inserito"
+    id: ev_validate_max_power
     trigger:
       - platform: state
         entity_id: input_number.ev_max_power_config_kw
     action:
-      - service: input_number.set_limit
-        target:
-          entity_id: input_number.ev_charging_power_kw
-        data:
-          max: "{{ states('input_number.ev_max_power_config_kw') | float(6.0) }}"
       - service: input_number.set_value
         target:
           entity_id: input_number.ev_charging_power_kw
@@ -151,6 +147,12 @@ automation:
             {% set current = states('input_number.ev_charging_power_kw') | float(0) %}
             {% set max_val = states('input_number.ev_max_power_config_kw') | float(6.0) %}
             {{ current if current <= max_val else max_val }}
+      
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: "EV UI: Valore target validato rispetto al tetto di {{ states('input_number.ev_max_power_config_kw') }}kW"
 
   # --- AUTOMAZIONE 4: RESET ---
   - alias: "EV - Reset Profili OCPP"
