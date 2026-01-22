@@ -1,46 +1,134 @@
 # Configurazione Unificata OCPP con Modulazione Dinamica (Power Balancing)
-# Utilizza ocpp.set_charge_rate con notazione puramente YAML
+# Protezione attiva per Ioniq 5 e prevenzione distacco contatore
 # Identificativo wallbox: "charger" (dev_id)
 
+logger:
+  default: warning
+  logs:
+    ocpp_modulation: info
+    ocpp_automation: info
+    homeassistant.components.system_log: info
+    custom_components.ocpp: info
+
+template:
+  - sensor:
+      - name: "Consumo Casa Senza Auto"
+        unique_id: house_consumption_no_ev
+        unit_of_measurement: "kW"
+        device_class: power
+        state: >
+          {# 1. Potenza totale al contatore (NEGATIVA se preleva, POSITIVA se immette) #}
+          {% set grid_w = states('sensor.inverter_grid_power') | float(0) %}
+          
+          {# 2. Convertiamo in kW: POSITIVO = stiamo prelevando (comprando dalla rete) #}
+          {% set net_import_kw = (grid_w * -1) / 1000 %}
+          
+          {# 3. Potenza Istantanea della Wallbox (in kW) #}
+          {% set ev_kw = states('sensor.charger_power_active_import') | float(0) %}
+          
+          {# 4. Sottraiamo l'auto dal totale rete per trovare il carico degli elettrodomestici #}
+          {% set house_kw = net_import_kw - ev_kw %}
+          
+          {# Filtro di sicurezza: mai sotto zero e arrotondamento a 2 decimali #}
+          {{ [house_kw, 0.0] | max | round(2) }}
+
 input_number:
-  # Valore numerico per la potenza DESIDERATA (kW) - Modalità BOX per inserimento tastiera
   ev_charging_power_kw:
     name: "Potenza di Ricarica Target (kW)"
     initial: 3.7
-    min: 0
+    min: 1.4
     max: 6
     step: 0.1
     mode: box
     unit_of_measurement: kW
     icon: mdi:gauge
 
-  # Configurazione del limite massimo - Modalità BOX
   ev_max_power_config_kw:
-    name: "Limite Massimo Configurato (kW)"
+    name: "Limite Massimo Contatore (kW)"
     initial: 6
     min: 1.4
-    max: 6
+    max: 6.6
     step: 0.1
     mode: box
     unit_of_measurement: kW
     icon: mdi:shield-check
 
+  ev_dynamic_buffer_kw:
+    name: "Buffer di Sicurezza (kW)"
+    initial: 0.5
+    min: 0.2
+    max: 2
+    step: 0.1
+    mode: box
+    unit_of_measurement: kW
+    icon: mdi:safety-goggles
+
+  ev_last_sent_watt:
+    name: "Ultima Potenza Inviata (W)"
+    initial: -1
+    min: -1
+    max: 7400
+    step: 1
+    mode: slider
+    unit_of_measurement: W
+    icon: mdi:transmit
+
 input_boolean:
-  # Switch per attivare/disattivare il bilanciamento dinamico
   ev_dynamic_balancing_enabled:
     name: "Modulazione Carico Dinamica"
     initial: false
     icon: mdi:scale-balance
 
+  ev_dry_run_mode:
+    name: "Modalità Test (Dry-Run)"
+    initial: false
+    icon: mdi:test-tube
+
 input_button:
-  # Pulsante per il reset manuale dei profili
   ev_reset_ocpp_profiles:
     name: "Reset Profili OCPP"
     icon: mdi:refresh
 
 automation:
-  # --- AUTOMAZIONE 1: LIMITE TARGET (STACK 1) ---
-  # Imposta il limite scelto manualmente nel TxDefaultProfile
+  # --- AUTOMAZIONE 0: INIZIALIZZAZIONE ---
+  - alias: "EV - Inizializzazione Prima Volta"
+    id: ev_first_time_sync
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+      - platform: state
+        entity_id: sensor.charger_power_offered
+    condition:
+      - condition: template
+        value_template: >
+          {{ states('input_number.ev_last_sent_watt') | float == -1 and 
+             states('sensor.charger_power_offered') | float(0) > 0 }}
+    action:
+      - variables:
+          raw_value: "{{ states('sensor.charger_power_offered') | float(0) }}"
+          detected_kw: >
+            {% if raw_value < 100 %} {{ raw_value | round(1) }}
+            {% else %} {{ (raw_value / 1000) | round(1) }}
+            {% endif %}
+          final_kw: "{{ [detected_kw | float, 1.4] | max }}"
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: "[Init] Rilevata potenza wallbox: {{ raw_value }}. Sincronizzo slider a {{ final_kw }}kW"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.ev_charging_power_kw
+        data:
+          value: "{{ final_kw }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.ev_last_sent_watt
+        data:
+          value: "{{ (final_kw * 1000) | round(0) }}"
+
+  # --- AUTOMAZIONE 1: TARGET UTENTE (STACK 1) ---
   - alias: "EV - Imposta Target TxDefaultProfile"
     id: ev_set_target_default_profile
     mode: restart
@@ -48,115 +136,123 @@ automation:
       - platform: state
         entity_id: input_number.ev_charging_power_kw
     action:
+      - delay: "00:00:02"
       - variables:
           target_kw: "{{ states('input_number.ev_charging_power_kw') | float(0) }}"
-          target_amps: "{{ ((target_kw * 1000) / 230) | round(1) }}"
-          effective_limit: "{{ target_amps if target_amps >= 6 else 0 }}"
-          trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+          target_w: "{{ (target_kw * 1000) | round(0) }}"
+          target_amps: "{{ (target_w / 230) | round(1) }}"
+          last_sent: "{{ states('input_number.ev_last_sent_watt') | float(-1) }}"
+          dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
+      - if:
+          - condition: template
+            value_template: "{{ last_sent == -1 or (last_sent - target_w) | abs > 100 }}"
+        then:
+          - service: system_log.write
+            data:
+              level: info
+              logger: ocpp_automation
+              message: "[Target] Invio ocpp.set_charge_rate (Stack 1): {{ target_kw }}kW ({{ target_amps }}A). Dry-run: {{ dry_run }}"
+          - if:
+              - condition: template
+                value_template: "{{ not dry_run }}"
+            then:
+              - service: ocpp.set_charge_rate
+                data:
+                  conn_id: 1
+                  custom_profile:
+                    chargingProfileId: 1
+                    stackLevel: 1
+                    chargingProfilePurpose: "TxDefaultProfile"
+                    chargingProfileKind: "Relative"
+                    chargingSchedule:
+                      chargingRateUnit: "A"
+                      chargingSchedulePeriod:
+                        - startPeriod: 0
+                          limit: "{{ target_amps if target_amps >= 6 else 0 }}"
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.ev_last_sent_watt
+            data:
+              value: "{{ target_w }}"
 
-      - service: system_log.write
-        data:
-          level: info
-          logger: ocpp_automation
-          message: >
-            [TxDefault] Impostazione target: {{ target_kw }}kW ({{ target_amps }}A). 
-            TransactionId: {{ trans_id }}. Limite applicato: {{ effective_limit }}A.
-
-      - service: ocpp.set_charge_rate
-        data:
-          conn_id: 1
-          custom_profile:
-            transactionId: "{{ trans_id }}"
-            chargingProfileId: 1
-            stackLevel: 1
-            chargingProfilePurpose: "TxDefaultProfile"
-            chargingProfileKind: "Relative"
-            chargingSchedule:
-              chargingRateUnit: "A"
-              chargingSchedulePeriod:
-                - startPeriod: 0
-                  limit: "{{ effective_limit }}"
-
-  # --- AUTOMAZIONE 2: MODULAZIONE DINAMICA (STACK 2) ---
-  # Sovrascrive lo stack 1 basandosi sulla disponibilità dell'inverter
-  # Throttling di 30 secondi per non stressare l'auto (Ioniq 5)
+  # --- AUTOMAZIONE 2: BILANCIAMENTO DINAMICO (STACK 2) ---
   - alias: "EV - Modulazione Dinamica TxProfile"
     id: ev_modulate_tx_profile
     mode: restart
     trigger:
       - platform: state
-        entity_id: sensor.inverter_grid_power
-      - platform: state
-        entity_id: input_boolean.ev_dynamic_balancing_enabled
+        entity_id: sensor.consumo_casa_senza_auto
     condition:
-      # Condizione 1: Modulazione abilitata da UI
       - condition: state
         entity_id: input_boolean.ev_dynamic_balancing_enabled
         state: "on"
-      # Condizione 2: Carica effettivamente in corso (Transaction ID > 0)
       - condition: template
         value_template: "{{ states('sensor.charger_transaction_id') | int(0) > 0 }}"
     action:
+      - delay: "00:00:10"
       - variables:
-          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(0) }}"
-          trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
-          # sensor.inverter_grid_power: positivo = immissione, negativo = prelievo
-          grid_power_kw: "{{ states('sensor.inverter_grid_power') | float(0) / 1000 }}"
-          available_kw: "{{ target_kw + grid_power_kw }}"
-          final_kw: "{{ [available_kw, target_kw] | min | float(0) }}"
-          calculated_amps: "{{ (final_kw * 1000) / 230 }}"
-          effective_limit: "{{ calculated_amps | round(1) if calculated_amps >= 6 else 0 }}"
+          house_only_kw: "{{ states('sensor.consumo_casa_senza_auto') | float(0) }}"
+          max_limit_kw: "{{ states('input_number.ev_max_power_config_kw') | float(6.0) }}"
+          target_user_kw: "{{ states('input_number.ev_charging_power_kw') | float(3.7) }}"
+          buffer_kw: "{{ states('input_number.ev_dynamic_buffer_kw') | float(0.5) }}"
+          dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
+          
+          # Calcolo spazio per l'auto
+          available_for_ev_kw: "{{ max_limit_kw - house_only_kw - buffer_kw }}"
+          # Non superare mai il target scelto manualmente
+          final_kw: "{{ [ [available_for_ev_kw, target_user_kw] | min, 0 ] | max }}"
+          
+          new_watt: "{{ (final_kw * 1000) | round(0) }}"
+          last_watt: "{{ states('input_number.ev_last_sent_watt') | float(0) }}"
+          new_amps: "{{ (new_watt / 230) | round(1) }}"
+          
+          # Isteresi 350W per evitare oscillazioni inutili
+          should_run: "{{ (last_watt - new_watt) | abs >= 350 }}"
 
-      - service: system_log.write
-        data:
-          level: info
-          logger: ocpp_modulation
-          message: >
-            [Modulazione] Grid: {{ grid_power_kw | round(2) }}kW | Disp: {{ available_kw | round(2) }}kW 
-            -> Applicato: {{ final_kw | round(2) }}kW ({{ calculated_amps | round(1) }}A). TxID: {{ trans_id }}
-
-      - service: ocpp.set_charge_rate
-        data:
-          conn_id: 1
-          custom_profile:
-            transactionId: "{{ trans_id }}"
-            chargingProfileId: 2
-            stackLevel: 2
-            chargingProfilePurpose: "TxProfile"
-            chargingProfileKind: "Relative"
-            chargingSchedule:
-              chargingRateUnit: "A"
-              chargingSchedulePeriod:
-                - startPeriod: 0
-                  limit: "{{ effective_limit }}"
-      
-      - delay: "00:00:30"
-
-  # --- AUTOMAZIONE 3: VALIDAZIONE MASSIMO ---
-  - alias: "EV - Valida Massimo Inserito"
-    id: ev_validate_max_power
-    trigger:
-      - platform: state
-        entity_id: input_number.ev_max_power_config_kw
-    action:
-      - service: input_number.set_value
-        target:
-          entity_id: input_number.ev_charging_power_kw
-        data:
-          value: >
-            {% set current = states('input_number.ev_charging_power_kw') | float(0) %}
-            {% set max_val = states('input_number.ev_max_power_config_kw') | float(6.0) %}
-            {{ current if current <= max_val else max_val }}
-      
-      - service: system_log.write
-        data:
-          level: info
-          logger: ocpp_automation
-          message: "EV UI: Valore target validato rispetto al tetto di {{ states('input_number.ev_max_power_config_kw') }}kW"
+      - if:
+          - condition: template
+            value_template: "{{ should_run }}"
+        then:
+          - service: system_log.write
+            data:
+              level: info
+              logger: ocpp_modulation
+              message: >
+                [Mod] Invio ocpp.set_charge_rate (Stack 2): 
+                Limite({{max_limit_kw}}) - Casa({{house_only_kw}}) - Buffer({{buffer_kw}}) 
+                = Disp: {{ available_for_ev_kw | round(2) }}kW. Target: {{ final_kw | round(2) }}kW ({{ new_amps }}A)
+          
+          - if:
+              - condition: template
+                value_template: "{{ not dry_run }}"
+            then:
+              - service: ocpp.set_charge_rate
+                data:
+                  conn_id: 1
+                  custom_profile:
+                    transactionId: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+                    chargingProfileId: 2
+                    stackLevel: 2
+                    chargingProfilePurpose: "TxProfile"
+                    chargingProfileKind: "Relative"
+                    chargingSchedule:
+                      chargingRateUnit: "A"
+                      chargingSchedulePeriod:
+                        - startPeriod: 0
+                          limit: "{{ new_amps if new_amps >= 6 else 0 }}"
+          
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.ev_last_sent_watt
+            data:
+              value: "{{ new_watt }}"
+          
+          - delay: "00:00:25"
 
   # --- AUTOMAZIONE 4: RESET ---
   - alias: "EV - Reset Profili OCPP"
     id: ev_reset_ocpp_profiles
+    mode: restart
     trigger:
       - platform: state
         entity_id: input_button.ev_reset_ocpp_profiles
@@ -165,7 +261,33 @@ automation:
         data:
           level: warning
           logger: ocpp_automation
-          message: "Reset manuale dei profili OCPP per il dispositivo 'charger'."
+          message: "[Reset] Pulizia profili OCPP e ripristino TxDefaultProfile base"
       - service: ocpp.clear_profile
         data:
           dev_id: "charger"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.ev_last_sent_watt
+        data:
+          value: -1
+      - variables:
+          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(3.7) }}"
+          target_amps: "{{ ((target_kw * 1000) / 230) | round(1) }}"
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: "[Reset] Ripristino TxDefaultProfile a {{ target_kw }}kW ({{ target_amps }}A)"
+      - service: ocpp.set_charge_rate
+        data:
+          conn_id: 1
+          custom_profile:
+            chargingProfileId: 1
+            stackLevel: 1
+            chargingProfilePurpose: "TxDefaultProfile"
+            chargingProfileKind: "Relative"
+            chargingSchedule:
+              chargingRateUnit: "A"
+              chargingSchedulePeriod:
+                - startPeriod: 0
+                  limit: "{{ target_amps if target_amps >= 6 else 0 }}"
