@@ -29,8 +29,32 @@ template:
           {# 4. Sottraiamo l'auto dal totale rete per trovare il carico degli elettrodomestici #}
           {% set house_kw = net_import_kw - ev_kw %}
           
-          {# Filtro di sicurezza: mai sotto zero e arrotondamento a 2 decimali #}
+          {# Filtro di sicurezza e arrotondamento #}
           {{ [house_kw, 0.0] | max | round(2) }}
+
+      - name: "Stato Wallbox Parlante"
+        unique_id: wallbox_friendly_status
+        icon: >
+          {% set s = states('sensor.charger_status') %}
+          {% if s == 'Charging' %} mdi:ev-station
+          {% elif s in ['Occupied', 'Preparing'] %} mdi:car-connected
+          {% elif s == 'Available' %} mdi:ev-plug-type2
+          {% elif s == 'SuspendedEVSE' %} mdi:pause-circle
+          {% elif s == 'SuspendedEV' %} mdi:car-brake-parking
+          {% else %} mdi:alert-circle
+          {% endif %}
+        state: >
+          {% set s = states('sensor.charger_status') %}
+          {% if s == 'Available' %} Libera
+          {% elif s == 'Preparing' %} Inizializzazione
+          {% elif s == 'Charging' %} In Carica
+          {% elif s == 'SuspendedEV' %} Sospesa dall'Auto (Batteria Carica)
+          {% elif s == 'SuspendedEVSE' %} In Pausa (Gestione Carichi)
+          {% elif s == 'Finishing' %} Fine Sessione
+          {% elif s == 'Occupied' %} Cavo Collegato
+          {% elif s == 'Faulted' %} Errore Wallbox
+          {% else %} {{ s if s != 'unknown' else 'Disconnessa' }}
+          {% endif %}
 
 input_number:
   ev_charging_power_kw:
@@ -116,7 +140,7 @@ automation:
         data:
           level: info
           logger: ocpp_automation
-          message: "[Init] Rilevata potenza wallbox: {{ raw_value }}. Sincronizzo slider a {{ final_kw }}kW"
+          message: "[Init] Sincronizzazione slider a {{ final_kw }}kW"
       - service: input_number.set_value
         target:
           entity_id: input_number.ev_charging_power_kw
@@ -151,7 +175,7 @@ automation:
             data:
               level: info
               logger: ocpp_automation
-              message: "[Target] Invio ocpp.set_charge_rate (Stack 1): {{ target_kw }}kW ({{ target_amps }}A). Dry-run: {{ dry_run }}"
+              message: "[Target] Chiamata ocpp.set_charge_rate (Stack 1): {{ target_kw }}kW ({{ target_amps }}A)"
           - if:
               - condition: template
                 value_template: "{{ not dry_run }}"
@@ -182,10 +206,15 @@ automation:
     trigger:
       - platform: state
         entity_id: sensor.consumo_casa_senza_auto
+      - platform: time_pattern
+        minutes: "/1" # Heartbeat di sicurezza ogni minuto
     condition:
       - condition: state
         entity_id: input_boolean.ev_dynamic_balancing_enabled
         state: "on"
+      # Controllo stato Wallbox tramite il nuovo sensore o quello base
+      - condition: template
+        value_template: "{{ states('sensor.charger_status') in ['Charging', 'Occupied', 'Finishing'] }}"
       - condition: template
         value_template: "{{ states('sensor.charger_transaction_id') | int(0) > 0 }}"
     action:
@@ -197,17 +226,16 @@ automation:
           buffer_kw: "{{ states('input_number.ev_dynamic_buffer_kw') | float(0.5) }}"
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
           
-          # Calcolo spazio per l'auto
           available_for_ev_kw: "{{ max_limit_kw - house_only_kw - buffer_kw }}"
-          # Non superare mai il target scelto manualmente
           final_kw: "{{ [ [available_for_ev_kw, target_user_kw] | min, 0 ] | max }}"
           
           new_watt: "{{ (final_kw * 1000) | round(0) }}"
           last_watt: "{{ states('input_number.ev_last_sent_watt') | float(0) }}"
           new_amps: "{{ (new_watt / 230) | round(1) }}"
           
-          # Isteresi 350W per evitare oscillazioni inutili
-          should_run: "{{ (last_watt - new_watt) | abs >= 350 }}"
+          # Isteresi e controllo minimo 6A (oppure 0 per pausa)
+          effective_amps: "{{ new_amps if new_amps >= 6 else (0 if new_amps < 5 else 6) }}"
+          should_run: "{{ (last_watt - new_watt) | abs >= 350 or trigger.platform == 'time_pattern' }}"
 
       - if:
           - condition: template
@@ -218,9 +246,8 @@ automation:
               level: info
               logger: ocpp_modulation
               message: >
-                [Mod] Invio ocpp.set_charge_rate (Stack 2): 
-                Limite({{max_limit_kw}}) - Casa({{house_only_kw}}) - Buffer({{buffer_kw}}) 
-                = Disp: {{ available_for_ev_kw | round(2) }}kW. Target: {{ final_kw | round(2) }}kW ({{ new_amps }}A)
+                [Mod] Chiamata ocpp.set_charge_rate (Stack 2): 
+                Disp: {{ available_for_ev_kw | round(2) }}kW. Set: {{ final_kw | round(2) }}kW ({{ effective_amps }}A). Trigger: {{ trigger.platform }}
           
           - if:
               - condition: template
@@ -239,7 +266,7 @@ automation:
                       chargingRateUnit: "A"
                       chargingSchedulePeriod:
                         - startPeriod: 0
-                          limit: "{{ new_amps if new_amps >= 6 else 0 }}"
+                          limit: "{{ effective_amps }}"
           
           - service: input_number.set_value
             target:
@@ -261,10 +288,13 @@ automation:
         data:
           level: warning
           logger: ocpp_automation
-          message: "[Reset] Pulizia profili OCPP e ripristino TxDefaultProfile base"
+          message: "[Reset] Pulizia profili... attesa 5 secondi."
       - service: ocpp.clear_profile
         data:
           dev_id: "charger"
+      
+      - delay: "00:00:05" 
+      
       - service: input_number.set_value
         target:
           entity_id: input_number.ev_last_sent_watt
@@ -277,7 +307,7 @@ automation:
         data:
           level: info
           logger: ocpp_automation
-          message: "[Reset] Ripristino TxDefaultProfile a {{ target_kw }}kW ({{ target_amps }}A)"
+          message: "[Reset] Chiamata ocpp.set_charge_rate (Stack 1): {{ target_kw }}kW ({{ target_amps }}A)"
       - service: ocpp.set_charge_rate
         data:
           conn_id: 1
