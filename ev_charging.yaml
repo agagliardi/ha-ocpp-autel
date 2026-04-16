@@ -1,5 +1,5 @@
 # Configurazione Unificata OCPP con Modulazione Dinamica e Modalità Solare
-# Identificativo wallbox: "charger" (dev_id)
+# Ottimizzazione: Gestione soglia minima per ricarica solare e riduzione fluttuazioni
 
 logger:
   default: warning
@@ -9,42 +9,23 @@ logger:
 
 template:
   - sensor:
-      - name: "Consumo Casa Senza Auto"
-        unique_id: house_consumption_no_ev
+      - name: "Consumo Casa Reale"
+        unique_id: house_consumption_real
         unit_of_measurement: "kW"
         device_class: power
         state: >
+          {% set pv_w = states('sensor.inverter_pv_power') | float(0) %}
           {% set grid_w = states('sensor.inverter_grid_power') | float(0) %}
-          {# Valore negativo = prelievo, quindi lo invertiamo per avere il valore di import positivo #}
-          {% set net_import_kw = (grid_w * -1) / 1000 if grid_w < 0 else 0 %}
+          {% set battery_w = states('sensor.inverter_battery_power') | float(0) %}
           {% set ev_kw = states('sensor.charger_power_active_import') | float(0) %}
-          {% set house_kw = net_import_kw - ev_kw %}
+          
+          {% set import_w = grid_w * -1 if grid_w < 0 else 0 %}
+          {% set battery_discharge_w = battery_w * -1 if battery_w < 0 else 0 %}
+          {% set battery_charge_w = battery_w if battery_w > 0 else 0 %}
+          
+          {% set total_supply_kw = (pv_w + import_w + battery_discharge_w) / 1000 %}
+          {% set house_kw = total_supply_kw - (battery_charge_w / 1000) - ev_kw %}
           {{ [house_kw, 0.0] | max | round(2) }}
-
-      - name: "Stato Wallbox Parlante"
-        unique_id: wallbox_friendly_status
-        icon: >
-          {% set s = states('sensor.charger_status_connector') %}
-          {% if s == 'Charging' %} mdi:ev-station
-          {% elif s in ['Occupied', 'Preparing'] %} mdi:car-connected
-          {% elif s == 'Available' %} mdi:ev-plug-type2
-          {% elif s == 'SuspendedEVSE' %} mdi:pause-circle
-          {% elif s == 'SuspendedEV' %} mdi:car-brake-parking
-          {% else %} mdi:alert-circle
-          {% endif %}
-        state: >
-          {% set s = states('sensor.charger_status_connector') %}
-          {% if s == 'Available' %} Libera
-          {% elif s == 'Preparing' %} Inizializzazione
-          {% elif s == 'Charging' %} In Carica
-          {% elif s == 'SuspendedEV' %} Sospesa dall'Auto (Batteria Carica)
-          {% elif s == 'SuspendedEVSE' %} In Pausa (Gestione Carichi / Sole Insufficiente)
-          {% elif s == 'Finishing' %} Fine Sessione
-          {% elif s == 'Occupied' %} Cavo Collegato
-          {% elif s == 'Faulted' %} Errore Wallbox
-          {% else %} 
-            {% if is_state('sensor.charger_status_connector', 'unavailable') %} Disconnessa {% else %} {{ s }} {% endif %}
-          {% endif %}
 
 input_number:
   ev_charging_power_kw:
@@ -69,7 +50,7 @@ input_number:
 
   ev_dynamic_buffer_kw:
     name: "Buffer di Sicurezza (kW)"
-    initial: 0.3
+    initial: 0.4
     min: 0
     max: 2
     step: 0.1
@@ -98,93 +79,19 @@ input_boolean:
     initial: false
     icon: mdi:solar-power
 
-  ev_dry_run_mode:
-    name: "Modalità Test (Dry-Run)"
-    initial: false
-    icon: mdi:test-tube
-
-input_button:
-  ev_reset_ocpp_profiles:
-    name: "Reset Profili OCPP"
-    icon: mdi:refresh
-
 automation:
-  # --- INIZIALIZZAZIONE ALL'AVVIO ---
-  - alias: "EV - Inizializzazione all'Avvio"
-    id: ev_startup_init
-    mode: single
-    trigger:
-      - platform: homeassistant
-        event: start
-    action:
-      - delay: "00:00:15"
-      - service: system_log.write
-        data:
-          level: info
-          logger: ocpp_automation
-          message: "[EV Init] Avvio sistema. Richiesto allineamento stato wallbox."
-      - service: input_number.set_value
-        target:
-          entity_id: input_number.ev_last_sent_watt
-        data:
-          value: -1
-
-  # --- AUTOMAZIONE 1: TARGET UTENTE (STACK 1) ---
-  - alias: "EV - Imposta Target TxDefaultProfile"
-    id: ev_set_target_default_profile
-    mode: restart
-    trigger:
-      - platform: state
-        entity_id: input_number.ev_charging_power_kw
-    action:
-      - delay: "00:00:05" 
-      - variables:
-          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(0) }}"
-          target_w: "{{ (target_kw * 1000) | round(0) }}"
-          target_amps: "{{ (target_w / 230) | round(1) }}"
-          dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
-      - service: system_log.write
-        data:
-          level: info
-          logger: ocpp_automation
-          message: "[EV Target] Nuovo Limite Base: {{ target_kw }}kW ({{ target_amps }}A)."
-      - if:
-          - condition: template
-            value_template: "{{ not dry_run }}"
-        then:
-          - service: ocpp.set_charge_rate
-            data:
-              conn_id: 1
-              custom_profile:
-                chargingProfileId: 1
-                stackLevel: 1
-                chargingProfilePurpose: "TxDefaultProfile"
-                chargingProfileKind: "Relative"
-                chargingSchedule:
-                  chargingRateUnit: "A"
-                  chargingSchedulePeriod:
-                    - startPeriod: 0
-                      limit: "{{ target_amps if target_amps >= 6 else 1 }}"
-      - service: input_number.set_value
-        target:
-          entity_id: input_number.ev_last_sent_watt
-        data:
-          value: -1 
-
-  # --- AUTOMAZIONE 2: BILANCIAMENTO DINAMICO E MODALITA' SOLARE (STACK 2) ---
   - alias: "EV - Modulazione Dinamica TxProfile"
     id: ev_modulate_tx_profile
     mode: restart
     trigger:
       - platform: state
         entity_id: sensor.inverter_grid_power
-        for: "00:00:10" 
+        for: "00:00:30" # Aumentata la finestra di osservazione per stabilità
       - platform: state
-        entity_id: sensor.inverter_battery
+        entity_id: sensor.inverter_pv_power
+        for: "00:00:30"
       - platform: state
         entity_id: input_boolean.ev_solar_only_mode
-      - platform: time_pattern
-        minutes: "/2" 
     condition:
       - condition: state
         entity_id: input_boolean.ev_dynamic_balancing_enabled
@@ -195,61 +102,68 @@ automation:
              states('sensor.charger_status_connector') in ['Charging', 'SuspendedEVSE', 'Occupied'] }}
     action:
       - variables:
-          dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
           solar_mode: "{{ is_state('input_boolean.ev_solar_only_mode', 'on') }}"
-          
+          pv_w: "{{ states('sensor.inverter_pv_power') | float(0) }}"
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
+          battery_w: "{{ states('sensor.inverter_battery_power') | float(0) }}"
           ev_kw: "{{ states('sensor.charger_power_active_import') | float(0) }}"
-          battery_soc: "{{ states('sensor.inverter_battery') | float(0) }}"
           
-          export_kw: "{{ [grid_w / 1000, 0.0] | max }}"
-          import_kw: "{{ [(grid_w * -1) / 1000, 0.0] | max }}"
-          house_only_kw: "{{ [import_kw - ev_kw, 0.0] | max }}"
+          import_w: "{{ grid_w * -1 if grid_w < 0 else 0 }}"
+          battery_dis_w: "{{ battery_w * -1 if battery_w < 0 else 0 }}"
+          battery_ch_w: "{{ battery_w if battery_w > 0 else 0 }}"
+          
+          house_w: "{{ (pv_w + import_w + battery_dis_w) - battery_ch_w - (ev_kw * 1000) }}"
+          house_kw: "{{ [house_w / 1000, 0.0] | max }}"
+
+          actual_surplus_kw: "{{ [(pv_w / 1000) - house_kw, 0.0] | max }}"
 
           max_limit_kw: "{{ states('input_number.ev_max_power_config_kw') | float(6.0) }}"
+          buffer_kw: "{{ states('input_number.ev_dynamic_buffer_kw') | float(0.4) }}"
+          available_balancing_kw: "{{ max_limit_kw - house_kw - buffer_kw }}"
+
           target_user_kw: "{{ states('input_number.ev_charging_power_kw') | float(3.7) }}"
-          buffer_kw: "{{ states('input_number.ev_dynamic_buffer_kw') | float(0.3) }}"
-          last_sent_watt: "{{ states('input_number.ev_last_sent_watt') | float(0) }}"
-          last_amps: "{{ (last_sent_watt / 230) | round(1) }}"
+          last_sent_watt: "{{ states('input_number.ev_last_sent_watt') | float(-1) }}"
 
-          total_surplus_kw: "{{ export_kw + ev_kw }}"
-          available_balancing_kw: "{{ max_limit_kw - house_only_kw - buffer_kw }}"
-
-          # LOGICA DECISIONALE
           final_kw: >
             {% if solar_mode %}
-              {% if battery_soc < 80 %} 0.0
-              {% else %} {{ [total_surplus_kw, target_user_kw] | min }}
-              {% endif %}
+              {{ [actual_surplus_kw, target_user_kw] | min }}
             {% else %}
-              {{ [ [available_balancing_kw, target_user_kw] | min, 0 ] | max }}
+              {{ [available_balancing_kw, target_user_kw] | min }}
             {% endif %}
 
           new_watt: "{{ (final_kw * 1000) | round(0) }}"
           new_amps: "{{ (new_watt / 230) | round(1) }}"
-          effective_amps: "{{ new_amps if new_amps >= 6 else (1 if new_amps < 5.5 else 6) }}"
           
-          # Isteresi ridotta a 200W per superare il blocco dei 4kW
-          significant_change: "{{ (last_sent_watt - new_watt) | abs >= 200 }}"
-          value_changed: "{{ effective_amps != last_amps }}"
-          should_run: "{{ (value_changed and significant_change) or trigger.platform == 'time_pattern' or trigger.entity_id == 'input_boolean.ev_solar_only_mode' or last_sent_watt == -1 }}"
+          # MODIFICA SOGLIA: Se siamo tra 4.5A e 6A, forziamo 6A (circa 1.1kW - 1.4kW)
+          # Questo permette di usare il solare anche se manca un soffio alla soglia minima
+          effective_amps: >
+            {% if new_amps >= 5.8 %} {{ [new_amps, 32.0] | min }}
+            {% elif new_amps >= 4.5 and solar_mode %} 6.0
+            {% else %} 1.0
+            {% endif %}
+          
+          # ISTERESI: Aumentata a 500W per ridurre ulteriormente i comandi
+          significant_change: "{{ (last_sent_watt - new_watt) | abs >= 500 }}"
+          is_mode_switch: "{{ trigger.entity_id == 'input_boolean.ev_solar_only_mode' }}"
 
       - if:
           - condition: template
-            value_template: "{{ should_run }}"
+            value_template: "{{ is_mode_switch or significant_change or last_sent_watt == -1 }}"
         then:
+          - delay: "00:00:02"
+          
           - service: system_log.write
             data:
               level: info
               logger: ocpp_automation
               message: >
-                [EV Core] Modo: {{ 'SOLARE' if solar_mode else 'NORMALE' }}.
-                Disp: {{ available_balancing_kw | round(2) }}kW, Target: {{ target_user_kw }}kW.
-                Azione: {{ effective_amps }}A. (Causa: {{ 'Bilanciamento' if available_balancing_kw < target_user_kw else 'Target Utente' }}).
+                [EV Stability] Modo: {{ 'SOLARE' if solar_mode else 'NORMALE' }}.
+                Surplus: {{ actual_surplus_kw | round(2) }}kW. Azione: {{ effective_amps }}A.
+                (Delta: {{ (last_sent_watt - new_watt) | abs | round(0) }}W)
 
           - if:
               - condition: template
-                value_template: "{{ not dry_run }}"
+                value_template: "{{ not is_state('input_boolean.ev_dry_run_mode', 'on') }}"
             then:
               - service: ocpp.set_charge_rate
                 data:
@@ -264,7 +178,7 @@ automation:
                       chargingRateUnit: "A"
                       chargingSchedulePeriod:
                         - startPeriod: 0
-                          limit: "{{ effective_amps }}"
+                          limit: "{{ effective_amps | round(1) }}"
           
           - service: input_number.set_value
             target:
@@ -272,7 +186,6 @@ automation:
             data:
               value: "{{ new_watt }}"
 
-  # --- AUTOMAZIONE 4: RESET PROFILI ---
   - alias: "EV - Reset Profili OCPP"
     id: ev_reset_ocpp_profiles
     mode: restart
@@ -280,11 +193,6 @@ automation:
       - platform: state
         entity_id: input_button.ev_reset_ocpp_profiles
     action:
-      - service: system_log.write
-        data:
-          level: warning
-          logger: ocpp_automation
-          message: "[EV Reset] Pulizia profili OCPP reale richiesta."
       - service: ocpp.clear_profile
         data:
           dev_id: "charger"
@@ -294,19 +202,4 @@ automation:
           entity_id: input_number.ev_last_sent_watt
         data:
           value: -1
-      - variables:
-          target_kw: "{{ states('input_number.ev_charging_power_kw') | float(3.7) }}"
-          target_amps: "{{ ((target_kw * 1000) / 230) | round(1) }}"
-      - service: ocpp.set_charge_rate
-        data:
-          conn_id: 1
-          custom_profile:
-            chargingProfileId: 1
-            stackLevel: 1
-            chargingProfilePurpose: "TxDefaultProfile"
-            chargingProfileKind: "Relative"
-            chargingSchedule:
-              chargingRateUnit: "A"
-              chargingSchedulePeriod:
-                - startPeriod: 0
-                  limit: "{{ target_amps if target_amps >= 6 else 1 }}"
+
