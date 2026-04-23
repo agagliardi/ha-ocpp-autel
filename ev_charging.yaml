@@ -1,5 +1,5 @@
 # Configurazione Unificata OCPP con Modulazione Dinamica e Modalità Solare
-# Ottimizzazione: Gestione soglia minima per ricarica solare e riduzione fluttuazioni
+# Fix: Startup a 6kW, Solar Mode ON di default, reattività differenziata (veloce solo per sicurezza)
 
 logger:
   default: warning
@@ -14,25 +14,25 @@ template:
         unit_of_measurement: "kW"
         device_class: power
         state: >
-          {% set pv_w = states('sensor.inverter_pv_power') | float(0) %}
-          {% set grid_w = states('sensor.inverter_grid_power') | float(0) %}
-          {% set battery_w = states('sensor.inverter_battery_power') | float(0) %}
-          {% set ev_kw = states('sensor.charger_power_active_import') | float(0) %}
-          
-          {% set import_w = grid_w * -1 if grid_w < 0 else 0 %}
-          {% set battery_discharge_w = battery_w * -1 if battery_w < 0 else 0 %}
-          {% set battery_charge_w = battery_w if battery_w > 0 else 0 %}
-          
-          {% set total_supply_kw = (pv_w + import_w + battery_discharge_w) / 1000 %}
-          {% set house_kw = total_supply_kw - (battery_charge_w / 1000) - ev_kw %}
-          {{ [house_kw, 0.0] | max | round(2) }}
+          {% set pv = states('sensor.inverter_pv_power') | float(0) %}
+          {% set grid = states('sensor.inverter_grid_power') | float(0) %}
+          {% set batt = states('sensor.inverter_battery_power') | float(0) %}
+          {% set ev = states('sensor.charger_power_active_import') | float(0) * 1000 %}
+
+          {% set grid_import = grid | abs if grid < 0 else 0 %}
+          {% set batt_dis = batt | abs if batt < 0 else 0 %}
+          {% set grid_exp = grid if grid > 0 else 0 %}
+          {% set batt_ch = batt if batt > 0 else 0 %}
+
+          {% set house_w = (pv + grid_import + batt_dis) - grid_exp - batt_ch - ev %}
+          {{ [house_w / 1000, 0.0] | max | round(2) }}
 
 input_number:
   ev_charging_power_kw:
     name: "Potenza di Ricarica Target (kW)"
-    initial: 3.7
+    initial: 6.0
     min: 1.4
-    max: 6
+    max: 6.0
     step: 0.1
     mode: box
     unit_of_measurement: kW
@@ -40,7 +40,7 @@ input_number:
 
   ev_max_power_config_kw:
     name: "Limite Massimo Contatore (kW)"
-    initial: 6
+    initial: 6.0
     min: 1.4
     max: 6.6
     step: 0.1
@@ -76,91 +76,92 @@ input_boolean:
 
   ev_solar_only_mode:
     name: "Modalità Solo Surplus Fotovoltaico"
-    initial: false
+    initial: true
     icon: mdi:solar-power
+
+  ev_dry_run_mode:
+    name: "Modalità Test (Dry-Run)"
+    initial: false
+    icon: mdi:test-tube
 
 automation:
   - alias: "EV - Modulazione Dinamica TxProfile"
     id: ev_modulate_tx_profile
     mode: restart
     trigger:
+      # Reattività standard per variazioni normali
       - platform: state
-        entity_id: sensor.inverter_grid_power
-        for: "00:00:30" # Aumentata la finestra di osservazione per stabilità
-      - platform: state
-        entity_id: sensor.inverter_pv_power
+        entity_id: 
+          - sensor.inverter_grid_power
+          - sensor.inverter_pv_power
         for: "00:00:30"
+      # Reattività immediata per eventi critici o cambi modalità
       - platform: state
-        entity_id: input_boolean.ev_solar_only_mode
+        entity_id: 
+          - input_boolean.ev_solar_only_mode
+          - sensor.charger_status_connector
     condition:
       - condition: state
         entity_id: input_boolean.ev_dynamic_balancing_enabled
         state: "on"
-      - condition: template
-        value_template: >
-          {{ states('sensor.charger_transaction_id') | int(0) > 0 or 
-             states('sensor.charger_status_connector') in ['Charging', 'SuspendedEVSE', 'Occupied'] }}
     action:
       - variables:
           solar_mode: "{{ is_state('input_boolean.ev_solar_only_mode', 'on') }}"
           pv_w: "{{ states('sensor.inverter_pv_power') | float(0) }}"
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
           battery_w: "{{ states('sensor.inverter_battery_power') | float(0) }}"
-          ev_kw: "{{ states('sensor.charger_power_active_import') | float(0) }}"
           
-          import_w: "{{ grid_w * -1 if grid_w < 0 else 0 }}"
-          battery_dis_w: "{{ battery_w * -1 if battery_w < 0 else 0 }}"
-          battery_ch_w: "{{ battery_w if battery_w > 0 else 0 }}"
-          
-          house_w: "{{ (pv_w + import_w + battery_dis_w) - battery_ch_w - (ev_kw * 1000) }}"
-          house_kw: "{{ [house_w / 1000, 0.0] | max }}"
+          house_kw: "{{ states('sensor.house_consumption_real') | float(0) }}"
+          last_sent_watt: "{{ states('input_number.ev_last_sent_watt') | float(-1) }}"
 
-          actual_surplus_kw: "{{ [(pv_w / 1000) - house_kw, 0.0] | max }}"
+          # Calcolo Surplus
+          raw_surplus: "{{ (pv_w / 1000) - house_kw - (battery_w / 1000 if battery_w > 0 else (battery_w | abs / 1000) * 2) }}"
+          actual_surplus_kw: "{{ [raw_surplus, 0.0] | max }}"
 
+          # Calcolo Bilanciamento (Normal Mode)
           max_limit_kw: "{{ states('input_number.ev_max_power_config_kw') | float(6.0) }}"
           buffer_kw: "{{ states('input_number.ev_dynamic_buffer_kw') | float(0.4) }}"
           available_balancing_kw: "{{ max_limit_kw - house_kw - buffer_kw }}"
+          
+          target_user_kw: "{{ states('input_number.ev_charging_power_kw') | float(6.0) }}"
 
-          target_user_kw: "{{ states('input_number.ev_charging_power_kw') | float(3.7) }}"
-          last_sent_watt: "{{ states('input_number.ev_last_sent_watt') | float(-1) }}"
-
-          final_kw: >
-            {% if solar_mode %}
-              {{ [actual_surplus_kw, target_user_kw] | min }}
-            {% else %}
-              {{ [available_balancing_kw, target_user_kw] | min }}
-            {% endif %}
-
+          final_kw: "{{ [actual_surplus_kw, target_user_kw] | min if solar_mode else [available_balancing_kw, target_user_kw] | min }}"
           new_watt: "{{ (final_kw * 1000) | round(0) }}"
           new_amps: "{{ (new_watt / 230) | round(1) }}"
           
-          # MODIFICA SOGLIA: Se siamo tra 4.5A e 6A, forziamo 6A (circa 1.1kW - 1.4kW)
-          # Questo permette di usare il solare anche se manca un soffio alla soglia minima
           effective_amps: >
             {% if new_amps >= 5.8 %} {{ [new_amps, 32.0] | min }}
             {% elif new_amps >= 4.5 and solar_mode %} 6.0
             {% else %} 1.0
             {% endif %}
           
-          # ISTERESI: Aumentata a 500W per ridurre ulteriormente i comandi
-          significant_change: "{{ (last_sent_watt - new_watt) | abs >= 500 }}"
-          is_mode_switch: "{{ trigger.entity_id == 'input_boolean.ev_solar_only_mode' }}"
+          delta_w: "{{ (last_sent_watt - new_watt) | abs | round(0) }}"
+          
+          # LOGICA REATTIVITÀ:
+          # 1. Se stiamo prelevando troppo dalla rete (supero soglia), applica SEMPRE
+          is_over_limit: "{{ not solar_mode and grid_w < -(buffer_kw * 1000) }}"
+          # 2. Se la batteria sta scaricando forte, applica SEMPRE
+          is_batt_emergency: "{{ battery_w < -300 }}"
+          # 3. Altrimenti applica solo se cambio > 400W (isteresi per stabilità)
+          significant_change: "{{ delta_w >= 400 }}"
+          
+          should_apply: >
+            {{ is_over_limit or is_batt_emergency or significant_change or 
+               last_sent_watt == -1 or trigger.entity_id == 'input_boolean.ev_solar_only_mode' }}
+
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: >
+            [EV Analisi] Modo: {{ 'SOLARE' if solar_mode else 'NORMALE' }}. PV: {{ (pv_w/1000)|round(2) }}kW, Casa: {{ house_kw|round(2) }}kW, Batt: {{ (battery_w/1000)|round(2) }}kW. 
+            Applica: {{ 'SI (CRITICO)' if (is_over_limit or is_batt_emergency) else ('SI' if should_apply else 'NO') }}. Target: {{ effective_amps }}A.
 
       - if:
           - condition: template
-            value_template: "{{ is_mode_switch or significant_change or last_sent_watt == -1 }}"
+            value_template: "{{ should_apply }}"
         then:
-          - delay: "00:00:02"
-          
-          - service: system_log.write
-            data:
-              level: info
-              logger: ocpp_automation
-              message: >
-                [EV Stability] Modo: {{ 'SOLARE' if solar_mode else 'NORMALE' }}.
-                Surplus: {{ actual_surplus_kw | round(2) }}kW. Azione: {{ effective_amps }}A.
-                (Delta: {{ (last_sent_watt - new_watt) | abs | round(0) }}W)
-
+          - delay: "00:00:01"
           - if:
               - condition: template
                 value_template: "{{ not is_state('input_boolean.ev_dry_run_mode', 'on') }}"
@@ -185,21 +186,3 @@ automation:
               entity_id: input_number.ev_last_sent_watt
             data:
               value: "{{ new_watt }}"
-
-  - alias: "EV - Reset Profili OCPP"
-    id: ev_reset_ocpp_profiles
-    mode: restart
-    trigger:
-      - platform: state
-        entity_id: input_button.ev_reset_ocpp_profiles
-    action:
-      - service: ocpp.clear_profile
-        data:
-          dev_id: "charger"
-      - delay: "00:00:05"
-      - service: input_number.set_value
-        target:
-          entity_id: input_number.ev_last_sent_watt
-        data:
-          value: -1
-
