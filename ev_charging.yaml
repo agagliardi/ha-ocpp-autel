@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata e Commentata
+# Configurazione OCPP Semplificata V1.9 - Fix Reset su Riconnessione e Log Avanzati
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -7,7 +7,7 @@ logger:
     ocpp_automation: info
 
 # ----------------------------------------------------------------------------
-# 1. HELPER E CONFIGURAZIONI (Tutti i parametri richiesti)
+# 1. HELPER E CONFIGURAZIONI
 # ----------------------------------------------------------------------------
 input_number:
   ev_max_contatore:
@@ -28,7 +28,7 @@ input_number:
 
   ev_massima_carica:
     name: "Massima Carica (kW)"
-    initial: 6.0 # Tipicamente: Max Contatore - Soglia Sicurezza
+    initial: 6.0
     min: 1.4
     max: 11.0
     step: 0.1
@@ -58,7 +58,6 @@ input_number:
     step: 0.1
     unit_of_measurement: kW
 
-  # Sensore creato: Ultima potenza inviata
   ev_ultima_potenza_inviata:
     name: "Ultima Potenza Inviata (kW)"
     initial: 0.0
@@ -77,7 +76,6 @@ input_select:
     initial: "Dinamica"
 
 input_datetime:
-  # Sensore creato: Data e Ora ultimo invio
   ev_ultimo_invio_dt:
     name: "Data e Ora Ultimo Invio"
     has_date: true
@@ -88,10 +86,14 @@ input_boolean:
     name: "Modalità Test (Non inviare)"
     initial: false
   
-  # Supporto per gestire il minuto di attesa all'avvio
   ev_startup_delay_active:
     name: "Attesa di Avvio"
     initial: true
+
+input_text:
+  ev_ultima_modalita_inviata:
+    name: "Ultima Modalità Inviata"
+    initial: "Nessuna"
 
 input_button:
   ev_reset_profili:
@@ -101,19 +103,16 @@ input_button:
 # 2. AUTOMAZIONI
 # ----------------------------------------------------------------------------
 automation:
-  # --- LOGICA DI STARTUP (All'avvio di Home Assistant) ---
   - alias: "EV - Inizializzazione Avvio"
     trigger:
       - platform: homeassistant
         event: start
     action:
-      # Imposta la modalità a Dinamica
       - service: input_select.select_option
         target:
           entity_id: input_select.ev_modalita
         data:
           option: "Dinamica"
-      # Attiva la flag di attesa per un minuto
       - service: input_boolean.turn_on
         target:
           entity_id: input_boolean.ev_startup_delay_active
@@ -122,12 +121,8 @@ automation:
         target:
           entity_id: input_boolean.ev_startup_delay_active
 
-  # --- AUTOMAZIONE PRINCIPALE: CALCOLO E INVIO ---
   - alias: "EV - Logica di Ricarica Principale"
     id: ev_logica_principale
-    # 'mode: restart' crea esattamente la coda a 1 posto che hai chiesto.
-    # Se arriva un nuovo trigger durante il 'delay', cancella tutto e ricomincia
-    # ricalcolando con l'ultimissimo valore dei sensori.
     mode: restart 
     trigger:
       - platform: state
@@ -138,18 +133,20 @@ automation:
           - input_select.ev_modalita
           - input_number.ev_massima_carica
           - input_number.ev_max_contatore
+          - input_number.ev_minima_batteria_surplus
+      - platform: state
+        entity_id: sensor.charger_transaction_id # RESET: Scatta quando l'auto viene collegata/avviata
     action:
       - variables:
-          # --- LETTURA SENSORI (Convertiti tutti in kW per facilità) ---
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
-          grid_kw: "{{ (states('sensor.inverter_grid_power') | float(0)) / 1000 }}" # Negativo = Prelievo, Positivo = Immissione
-          
+          grid_kw: "{{ grid_w / 1000 }}"
           batt_pct: "{{ states('sensor.inverter_battery') | float(0) }}"
-          
           ev_w: "{{ states('sensor.charger_power_active_import') | float(0) }}"
-          ev_kw: "{{ (states('sensor.charger_power_active_import') | float(0)) / 1000 }}" # La presa dell'auto è sempre un valore positivo
+          ev_kw: "{{ ev_w / 1000 }}"
+          
+          # Stato fisico della wallbox per il log (Aggiornato con il nome corretto)
+          wb_status: "{{ states('sensor.charger_status_connector') | default('Sconosciuto') }}"
 
-          # --- LETTURA CONFIGURAZIONI ---
           mode: "{{ states('input_select.ev_modalita') }}"
           max_contatore: "{{ states('input_number.ev_max_contatore') | float(6.3) }}"
           soglia_sic: "{{ states('input_number.ev_soglia_sicurezza') | float(0.3) }}"
@@ -158,86 +155,71 @@ automation:
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.5) }}"
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
           
-          # Transazione attiva dalla wallbox
           trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+          limite_dinamico: "{{ max_contatore - soglia_sic }}"
 
-          # --- CALCOLO MATEMATICO DEL TARGET (Grezzo) ---
-          limite_dinamico: "{{ (max_contatore | float(0)) - (soglia_sic | float(0)) }}"
+          # Flag per capire se è appena iniziata una ricarica
+          is_new_transaction: "{{ trigger.entity_id == 'sensor.charger_transaction_id' and trigger.from_state.state | int(0) == 0 and trans_id > 0 }}"
+
+          reason: >
+            {% if mode == 'Surplus' %}
+              {% if grid_kw < 0 %} Prelievo Rete
+              {% elif batt_pct < min_batt %} Batteria Bassa ({{batt_pct}}% < {{min_batt}}%)
+              {% else %} OK
+              {% endif %}
+            {% else %} OK
+            {% endif %}
 
           target_calcolato: >
             {% if mode == 'Fissa' %}
-              {# Fissa: ignora tutto e manda la carica massima impostata #}
-              {{ max_carica_user | float(0) }}
-            
+              {{ max_carica_user }}
             {% elif mode == 'Dinamica' %}
-              {# Dinamica: Formula matematica universale per restare sotto il limite #}
-              {# Limite + (Rete + Auto). Funziona con immissione e prelievo! #}
-              {{ (limite_dinamico | float(0)) + (grid_kw | float(0)) + (ev_kw | float(0)) }}
-            
+              {{ limite_dinamico + grid_kw + ev_kw }}
             {% elif mode == 'Surplus' %}
-              {# Surplus: se preleviamo, o se batteria scarica -> Pausa (0.0) #}
-              {% if (grid_kw | float(0)) < 0 or (batt_pct | float(0)) < (min_batt | float(0)) %}
+              {% if grid_kw < 0 or batt_pct < min_batt %}
                 0.0
               {% else %}
-                {# Se immettiamo e batteria carica: Immissione + ConsumoAuto - Mantenimento #}
-                {{ (grid_kw | float(0)) + (ev_kw | float(0)) - (maint_kw | float(0)) }}
+                {{ grid_kw + ev_kw - maint_kw }}
               {% endif %}
             {% else %}
               0.0
             {% endif %}
 
-          # --- LIMITI FISICI E DI SICUREZZA ---
-          # 1. Il target non può MAI superare la Massima Carica impostata dall'utente
           target_limitato_user: "{{ [target_calcolato | float(0), max_carica_user | float(0)] | min }}"
-          
-          # 2. Il target non può MAI superare la Capacità Massima della Wallbox
           target_limitato_hw: "{{ [target_limitato_user | float(0), max_wallbox | float(0)] | min }}"
-          
-          # 3. Il target non può essere negativo (se lo è, diventa 0)
           final_kw: "{{ [target_limitato_hw | float(0), 0.0] | max | round(1) }}"
-          final_amps: "{{ (final_kw | float(0) * 1000) / 230 }}"
-
-          # Vincolo auto: Se sotto ~6A (1.4kW), manda a 1A per mettere in pausa senza staccare
-          eff_amps: "{{ final_amps | round(1) if (final_amps | float(0)) >= 5.8 else 1.0 }}"
-          eff_kw: "{{ ((eff_amps | float(0) * 230) / 1000) | round(1) }}"
-
-          # --- GESTIONE RITARDI (Coda a 1 posto e Attese) ---
-          is_startup: "{{ is_state('input_boolean.ev_startup_delay_active', 'on') }}"
           
-          # Calcola quanti secondi sono passati dall'ultimo invio
+          final_amps: "{{ ((final_kw * 1000) / 230) | round(1) }}"
+          eff_amps: "{{ final_amps if final_amps >= 5.8 else 1.0 }}"
+
+          is_startup: "{{ is_state('input_boolean.ev_startup_delay_active', 'on') }}"
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
-          
-          # Se in startup il delay è gestito dall'automazione iniziale, qui gestiamo solo il normale "15 secondi"
           attesa_normale: "{{ [ (15 - sec_dal_ultimo), 0 ] | max }}"
           
-          # Decidiamo il ritardo effettivo:
-          wait_time: "{{ 0 if is_startup else attesa_normale }}"
+          # Se è una nuova transazione, annulliamo l'attesa per resettare subito la wallbox
+          wait_time: "{{ 0 if (is_startup or is_new_transaction) else attesa_normale }}"
 
-          # Capiamo se c'è una variazione rispetto all'ultima volta
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(-1) }}"
-          is_changed: "{{ (final_kw | float(0)) != (last_sent_kw | float(-1)) or (last_sent_kw | float(-1)) == -1 }}"
+          last_mode: "{{ states('input_text.ev_ultima_modalita_inviata') }}"
           
-          # Applichiamo solo se c'è transazione, se è cambiato il valore, 
-          # o se un cambio modalità l'ha forzato
+          # FORZATURA: Invia se potenza/modo sono cambiati OPPURE se è una nuova connessione
+          is_changed: "{{ final_kw != last_sent_kw or mode != last_mode or last_sent_kw == -1 or is_new_transaction }}"
+          
           should_apply: "{{ trans_id > 0 and is_changed }}"
 
-      # --- ATTESA (Il cuore della coda da 1 posto) ---
-      # Se scatta un nuovo trigger, cancella tutto e riparte da capo!
       - delay:
           seconds: "{{ wait_time }}"
 
-      # --- LOGICA DI LOGGING ---
       - service: system_log.write
         data:
           level: info
           logger: ocpp_automation
           message: >
-            [EV] Modo: {{ mode }} | Rete: {{ grid_w }}W | Batt: {{ batt_pct }}% | Auto: {{ ev_w }}W
-            - Target Calc: {{ target_calcolato | round(2) }}kW | Da Inviare: {{ final_kw }}kW
-            - Inviato a Wallbox? {{ 'SI' if should_apply else 'NO (Nessuna Variazione)' }}
+            [EV] Modo: {{ mode }} | WB Status: {{ wb_status }} | Rete: {{ grid_w }}W | Auto: {{ ev_w }}W
+            - Target: {{ final_kw }}kW ({{ eff_amps }}A) | Ultimo Invio: {{ last_sent_kw }}kW
+            - Inviato? {{ 'SI (Nuova Transazione)' if is_new_transaction else ('SI' if should_apply else 'NO') }}
 
-      # --- INVIO ALLA WALLBOX ---
       - if:
           - condition: template
             value_template: "{{ should_apply }}"
@@ -247,13 +229,19 @@ automation:
               entity_id: input_number.ev_ultima_potenza_inviata
             data:
               value: "{{ final_kw }}"
-              
+          
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.ev_ultima_modalita_inviata
+            data:
+              value: "{{ mode }}"
+
           - service: input_datetime.set_datetime
             target:
               entity_id: input_datetime.ev_ultimo_invio_dt
             data:
               datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
-
+          
           - if:
               - condition: template
                 value_template: "{{ not is_state('input_boolean.ev_dry_run_mode', 'on') }}"
@@ -269,11 +257,8 @@ automation:
                     chargingProfileKind: "Relative"
                     chargingSchedule:
                       chargingRateUnit: "A"
-                      chargingSchedulePeriod:
-                        - startPeriod: 0
-                          limit: "{{ eff_amps }}"
+                      chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps }}"}]
 
-  # --- RESET PROFILI MANUALE ---
   - alias: "EV - Reset Profili OCPP"
     trigger:
       - platform: state
@@ -281,4 +266,4 @@ automation:
     action:
       - service: ocpp.clear_profile
         data:
-          device_id: "CH01" # Inserisci qui l'ID o usa l'helper se lo reintegri
+          device_id: "CH01"
