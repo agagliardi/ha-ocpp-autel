@@ -142,12 +142,12 @@ automation:
       - variables:
           # --- LETTURA SENSORI (Convertiti tutti in kW per facilità) ---
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
-          grid_kw: "{{ grid_w / 1000 }}" # Negativo = Prelievo, Positivo = Immissione
+          grid_kw: "{{ (states('sensor.inverter_grid_power') | float(0)) / 1000 }}" # Negativo = Prelievo, Positivo = Immissione
           
           batt_pct: "{{ states('sensor.inverter_battery') | float(0) }}"
           
           ev_w: "{{ states('sensor.charger_power_active_import') | float(0) }}"
-          ev_kw: "{{ ev_w / 1000 }}" # La presa dell'auto è sempre un valore positivo
+          ev_kw: "{{ (states('sensor.charger_power_active_import') | float(0)) / 1000 }}" # La presa dell'auto è sempre un valore positivo
 
           # --- LETTURA CONFIGURAZIONI ---
           mode: "{{ states('input_select.ev_modalita') }}"
@@ -162,25 +162,25 @@ automation:
           trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
 
           # --- CALCOLO MATEMATICO DEL TARGET (Grezzo) ---
-          limite_dinamico: "{{ max_contatore - soglia_sic }}"
+          limite_dinamico: "{{ (max_contatore | float(0)) - (soglia_sic | float(0)) }}"
 
           target_calcolato: >
             {% if mode == 'Fissa' %}
               {# Fissa: ignora tutto e manda la carica massima impostata #}
-              {{ max_carica_user }}
+              {{ max_carica_user | float(0) }}
             
             {% elif mode == 'Dinamica' %}
               {# Dinamica: Formula matematica universale per restare sotto il limite #}
               {# Limite + (Rete + Auto). Funziona con immissione e prelievo! #}
-              {{ limite_dinamico + grid_kw + ev_kw }}
+              {{ (limite_dinamico | float(0)) + (grid_kw | float(0)) + (ev_kw | float(0)) }}
             
             {% elif mode == 'Surplus' %}
               {# Surplus: se preleviamo, o se batteria scarica -> Pausa (0.0) #}
-              {% if grid_kw < 0 or batt_pct < min_batt %}
+              {% if (grid_kw | float(0)) < 0 or (batt_pct | float(0)) < (min_batt | float(0)) %}
                 0.0
               {% else %}
                 {# Se immettiamo e batteria carica: Immissione + ConsumoAuto - Mantenimento #}
-                {{ grid_kw + ev_kw - maint_kw }}
+                {{ (grid_kw | float(0)) + (ev_kw | float(0)) - (maint_kw | float(0)) }}
               {% endif %}
             {% else %}
               0.0
@@ -188,18 +188,18 @@ automation:
 
           # --- LIMITI FISICI E DI SICUREZZA ---
           # 1. Il target non può MAI superare la Massima Carica impostata dall'utente
-          target_limitato_user: "{{ [target_calcolato | float, max_carica_user] | min }}"
+          target_limitato_user: "{{ [target_calcolato | float(0), max_carica_user | float(0)] | min }}"
           
           # 2. Il target non può MAI superare la Capacità Massima della Wallbox
-          target_limitato_hw: "{{ [target_limitato_user | float, max_wallbox] | min }}"
+          target_limitato_hw: "{{ [target_limitato_user | float(0), max_wallbox | float(0)] | min }}"
           
           # 3. Il target non può essere negativo (se lo è, diventa 0)
-          final_kw: "{{ [target_limitato_hw | float, 0.0] | max | round(1) }}"
-          final_amps: "{{ (final_kw * 1000) / 230 }}"
+          final_kw: "{{ [target_limitato_hw | float(0), 0.0] | max | round(1) }}"
+          final_amps: "{{ (final_kw | float(0) * 1000) / 230 }}"
 
           # Vincolo auto: Se sotto ~6A (1.4kW), manda a 1A per mettere in pausa senza staccare
-          eff_amps: "{{ final_amps | round(1) if final_amps >= 5.8 else 1.0 }}"
-          eff_kw: "{{ ((eff_amps * 230) / 1000) | round(1) }}"
+          eff_amps: "{{ final_amps | round(1) if (final_amps | float(0)) >= 5.8 else 1.0 }}"
+          eff_kw: "{{ ((eff_amps | float(0) * 230) / 1000) | round(1) }}"
 
           # --- GESTIONE RITARDI (Coda a 1 posto e Attese) ---
           is_startup: "{{ is_state('input_boolean.ev_startup_delay_active', 'on') }}"
@@ -216,7 +216,7 @@ automation:
 
           # Capiamo se c'è una variazione rispetto all'ultima volta
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(-1) }}"
-          is_changed: "{{ final_kw != last_sent_kw or last_sent_kw == -1 }}"
+          is_changed: "{{ (final_kw | float(0)) != (last_sent_kw | float(-1)) or (last_sent_kw | float(-1)) == -1 }}"
           
           # Applichiamo solo se c'è transazione, se è cambiato il valore, 
           # o se un cambio modalità l'ha forzato
