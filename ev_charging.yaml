@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V2.0 - Fix Definitivo TypeError e Reset Transazione
+# Configurazione OCPP Semplificata V2.2 - Protezione Loop Surplus e Isteresi
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -131,22 +131,17 @@ automation:
           - sensor.inverter_battery
           - sensor.charger_power_active_import
           - input_select.ev_modalita
-          - input_number.ev_massima_carica
-          - input_number.ev_max_contatore
-          - input_number.ev_minima_batteria_surplus
       - platform: state
         entity_id: sensor.charger_transaction_id
     action:
       - variables:
-          # --- LETTURE SENSORI CON FILTRO NUMERICO RIGIDO ---
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
-          grid_kw: "{{ (states('sensor.inverter_grid_power') | float(0)) / 1000 }}"
+          grid_kw: "{{ grid_w / 1000 }}"
           batt_pct: "{{ states('sensor.inverter_battery') | float(0) }}"
           ev_w: "{{ states('sensor.charger_power_active_import') | float(0) }}"
-          ev_kw: "{{ (states('sensor.charger_power_active_import') | float(0)) / 1000 }}"
+          ev_kw: "{{ ev_w / 1000 }}"
           wb_status: "{{ states('sensor.charger_status_connector') | default('Sconosciuto') }}"
 
-          # --- CONFIGURAZIONI ---
           mode: "{{ states('input_select.ev_modalita') }}"
           max_contatore: "{{ states('input_number.ev_max_contatore') | float(6.3) }}"
           soglia_sic: "{{ states('input_number.ev_soglia_sicurezza') | float(0.3) }}"
@@ -156,47 +151,60 @@ automation:
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
           
           trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
-          limite_dinamico: "{{ (max_contatore | float(0)) - (soglia_sic | float(0)) }}"
+          limite_dinamico: "{{ max_contatore - soglia_sic }}"
 
-          # Flag Reset su Nuova Transazione
           is_new_transaction: "{{ trigger.entity_id == 'sensor.charger_transaction_id' and trigger.from_state.state | int(0) == 0 and trans_id > 0 }}"
 
-          # --- LOGICA CALCOLO (Ogni operazione ha il suo float) ---
+          # CALCOLO POTENZA SOLARE DISPONIBILE (Rete + Consumo attuale auto)
+          # Se grid_kw è positivo (immissione), si somma. Se è negativo (prelievo), si sottrae.
+          potenza_disponibile_netta: "{{ grid_kw + ev_kw - maint_kw }}"
+
           target_calcolato: >
             {% if mode == 'Fissa' %}
-              {{ max_carica_user | float(0) }}
+              {{ max_carica_user }}
             {% elif mode == 'Dinamica' %}
-              {{ (limite_dinamico | float(0)) + (grid_kw | float(0)) + (ev_kw | float(0)) }}
+              {{ limite_dinamico + grid_kw + ev_kw }}
             {% elif mode == 'Surplus' %}
-              {% if (grid_kw | float(0)) < 0 or (batt_pct | float(0)) < (min_batt | float(0)) %}
+              {% if batt_pct < min_batt %}
                 0.0
               {% else %}
-                {{ (grid_kw | float(0)) + (ev_kw | float(0)) - (maint_kw | float(0)) }}
+                {{ potenza_disponibile_netta }}
               {% endif %}
             {% else %}
               0.0
             {% endif %}
 
-          # --- LIMITI E ARROTONDAMENTI ---
           target_limitato_user: "{{ [target_calcolato | float(0), max_carica_user | float(0)] | min }}"
           target_limitato_hw: "{{ [target_limitato_user | float(0), max_wallbox | float(0)] | min }}"
-          final_kw: "{{ [target_limitato_hw | float(0), 0.0] | max | round(1) }}"
+          
+          # ISTERESI SURPLUS: Non spegnere se il calcolo è tra 0 e 0.6kW a meno che non stiamo prelevando seriamente
+          final_kw: >
+            {% set raw = target_limitato_hw | float(0) %}
+            {% if mode == 'Surplus' %}
+              {% if raw < 0.6 and grid_kw > -0.2 %} 
+                {# Se il surplus è basso ma non stiamo prelevando molto, manteniamo il minimo invece di spegnere #}
+                {{ [states('input_number.ev_ultima_potenza_inviata') | float(0), 1.4] | min if wb_status == 'Charging' else 0.0 }}
+              {% else %}
+                {{ raw | round(1) }}
+              {% endif %}
+            {% else %}
+              {{ raw | round(1) }}
+            {% endif %}
           
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
           eff_amps: "{{ final_amps | float if (final_amps | float(0)) >= 5.8 else 1.0 }}"
 
-          # --- GESTIONE TEMPI E INVIO ---
-          is_startup: "{{ is_state('input_boolean.ev_startup_delay_active', 'on') }}"
+          # GESTIONE TEMPI
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
-          attesa_normale: "{{ [ (15 - sec_dal_ultimo), 0 ] | max }}"
-          
-          wait_time: "{{ 0 if (is_startup or is_new_transaction) else attesa_normale }}"
+          delay_config: "{{ 45 if wb_status == 'SuspendedEVSE' else 20 }}"
+          wait_time: "{{ 0 if (is_new_transaction or is_state('input_boolean.ev_startup_delay_active', 'on')) else [ (delay_config - sec_dal_ultimo), 0 ] | max }}"
 
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(-1) }}"
           last_mode: "{{ states('input_text.ev_ultima_modalita_inviata') }}"
           
-          is_changed: "{{ (final_kw | float(0)) != (last_sent_kw | float(-1)) or mode != last_mode or is_new_transaction }}"
+          diff: "{{ (final_kw | float(0) - last_sent_kw | float(0)) | abs }}"
+          is_changed: "{{ diff >= 0.2 or mode != last_mode or is_new_transaction }}"
           should_apply: "{{ trans_id > 0 and is_changed }}"
 
       - delay:
@@ -207,9 +215,9 @@ automation:
           level: info
           logger: ocpp_automation
           message: >
-            [EV] Modo: {{ mode }} | Status: {{ wb_status }} | Rete: {{ grid_w | float(0) }}W | Auto: {{ ev_w | float(0) }}W
-            - Target: {{ final_kw | float(0) }}kW ({{ eff_amps | float(0) }}A) | Ultimo: {{ last_sent_kw | float(0) }}kW
-            - Inviato? {{ 'SI (Nuova Transazione)' if is_new_transaction else ('SI' if should_apply else 'NO') }}
+            [EV] Modo: {{ mode }} | Status: {{ wb_status }} | Rete: {{ grid_w }}W | Auto: {{ ev_w }}W
+            - Disponibile: {{ potenza_disponibile_netta | round(2) }}kW | Target: {{ final_kw }}kW
+            - Inviato? {{ 'SI' if should_apply else 'NO' }}
 
       - if:
           - condition: template
@@ -233,28 +241,15 @@ automation:
             data:
               datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
           
-          - if:
-              - condition: template
-                value_template: "{{ not is_state('input_boolean.ev_dry_run_mode', 'on') }}"
-            then:
-              - service: ocpp.set_charge_rate
-                data:
-                  conn_id: 1
-                  custom_profile:
-                    transactionId: "{{ trans_id | int(0) }}"
-                    chargingProfileId: 2
-                    stackLevel: 2
-                    chargingProfilePurpose: "TxProfile"
-                    chargingProfileKind: "Relative"
-                    chargingSchedule:
-                      chargingRateUnit: "A"
-                      chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
-
-  - alias: "EV - Reset Profili OCPP"
-    trigger:
-      - platform: state
-        entity_id: input_button.ev_reset_profili
-    action:
-      - service: ocpp.clear_profile
-        data:
-          device_id: "CH01"
+          - service: ocpp.set_charge_rate
+            data:
+              conn_id: 1
+              custom_profile:
+                transactionId: "{{ trans_id | int(0) }}"
+                chargingProfileId: 2
+                stackLevel: 2
+                chargingProfilePurpose: "TxProfile"
+                chargingProfileKind: "Relative"
+                chargingSchedule:
+                  chargingRateUnit: "A"
+                  chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
