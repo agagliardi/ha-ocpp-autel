@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V2.9 - Anti-Oscillazione e Filtro Isteresi
+# Configurazione OCPP Semplificata V3.1 - PROTEZIONE BATTERIA DINAMICA & FIX LOG
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -86,6 +86,11 @@ input_text:
     name: "Ultima Modalità Inviata"
     initial: "Nessuna"
 
+input_boolean:
+  ev_dry_run_mode:
+    name: "Modalità Test (Dry-Run)"
+    initial: false
+
 input_button:
   ev_reset_profili:
     name: "Reset Profili OCPP"
@@ -106,19 +111,33 @@ automation:
       - platform: state
         entity_id: 
           - sensor.inverter_grid_power
+          - sensor.inverter_battery_power
           - sensor.charger_power_active_import
           - input_select.ev_modalita
     action:
       - variables:
-          # --- LETTURE ---
+          # --- LETTURE SENSORI (Convertiti in kW) ---
           grid_w: "{{ states('sensor.inverter_grid_power') | float(0) }}"
-          grid_kw: "{{ grid_w / 1000 }}"
+          grid_kw: "{{ grid_w / 1000 }}" # + Immissione, - Prelievo
+          
+          # Gestione Batteria: + carica (accumulo), - scarica (erogazione alla casa/auto)
+          batt_w: "{{ states('sensor.inverter_battery_power') | float(0) }}"
+          batt_kw: "{{ batt_w / 1000 }}" 
           batt_pct: "{{ states('sensor.inverter_battery') | float(0) }}"
+          
           raw_ev: "{{ states('sensor.charger_power_active_import') | float(0) }}"
           ev_kw: "{{ raw_ev / 1000 if raw_ev > 50 else raw_ev }}" 
-          trans_id: "{{ states('sensor.charger_transaction_id') | int(0) }}"
+          wb_status: "{{ states('sensor.charger_status_connector') | default(states('sensor.charger_status') | default('Sconosciuto')) }}"
 
-          # --- CONFIG ---
+          # Rilevamento automatico e robusto del Transaction ID
+          trans_id: >
+            {% set t_id = states('sensor.charger_transaction_id') | int(0) %}
+            {% if t_id == 0 %}
+              {% set t_id = states('sensor.ae0007a1gn5c008960_transaction_id') | int(0) %}
+            {% endif %}
+            {{ t_id }}
+
+          # --- CONFIGURAZIONI ---
           mode: "{{ states('input_select.ev_modalita') }}"
           max_contatore: "{{ states('input_number.ev_max_contatore') | float(6.3) }}"
           soglia_sic: "{{ states('input_number.ev_soglia_sicurezza') | float(0.4) }}"
@@ -126,16 +145,25 @@ automation:
           min_batt_surplus: "{{ states('input_number.ev_minima_batteria_surplus') | float(20) }}"
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.3) }}"
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
+          dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
           
-          # Calcolo potenziale disponibile
-          pot_disp: "{{ grid_kw + ev_kw - maint_kw }}"
+          # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
+          # Se batt_kw è negativo (scarica), registriamo quanta potenza l'auto sta "rubando" alla batteria.
+          # Questo valore deve essere ridotto dal calcolo totale per costringere l'auto a scendere.
+          batt_drain_kw: "{{ batt_kw if batt_kw < 0 else 0.0 }}"
+
+          # --- CALCOLO DISPONIBILITA' ---
+          # Formula corretta: Rete + Batteria (se scarica, riduce la disponibilità) + Consumo auto - Mantenimento
+          pot_disp: "{{ grid_kw + batt_drain_kw + ev_kw - maint_kw }}"
 
           # --- CALCOLO TARGET TEORICO ---
+          # Integriamo il controllo batteria anche nella Dinamica per evitare che "succhi" l'accumulo di casa
           target_teorico: >
             {% if mode == 'Fissa' %} 
               {{ max_carica_user }}
             {% elif mode == 'Dinamica' %} 
-              {{ max_contatore - soglia_sic + grid_kw + ev_kw }}
+              {# Calcolo limite contatore considerando anche la batteria se si sta scaricando #}
+              {{ max_contatore - soglia_sic + grid_kw + batt_drain_kw + ev_kw }}
             {% elif mode == 'Surplus' %}
               {% if pot_disp >= 1.3 or batt_pct >= min_batt_surplus %}
                 {{ pot_disp }}
@@ -144,18 +172,17 @@ automation:
               {% endif %}
             {% else %} 0.0 {% endif %}
 
-          # Limitazione fisica e utente
           temp_target: "{{ [target_teorico | float(0), max_carica_user | float(0), max_wallbox | float(0)] | min }}"
           
-          # Logica Spegnimento (Solo Surplus)
+          # Logica Spegnimento (Solo Surplus, basata su Rete e stato della Batteria)
           wants_to_stop: >
             {% if mode == 'Surplus' %}
-              {% if temp_target < 1.3 and (grid_kw < -0.5 or batt_pct < 15) %} true {% else %} false {% endif %}
+              {% if temp_target < 1.3 and (grid_kw < -0.4 or batt_pct < 15) %} true {% else %} false {% endif %}
             {% else %} false {% endif %}
           
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(0) }}"
 
-          # Calcolo Finale con Arrotondamento a 0.1kW
+          # Calcolo Finale
           final_kw: >
             {% if mode == 'Surplus' and wants_to_stop %}
               {% if is_state('timer.ev_off_delay', 'active') %} {{ [last_sent_kw, 1.4]|max }} {% else %} 0.0 {% endif %}
@@ -164,25 +191,28 @@ automation:
             {% endif %}
 
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
-          # Arrotondiamo gli ampere a mezzo punto per stabilità
           eff_amps: "{{ final_amps | float if final_amps >= 6.0 else (1.0 if final_kw < 0.5 else 6.0) }}"
 
-          # --- VERIFICA INVIO (ISTERESI) ---
+          # --- VERIFICA INVIO ---
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
-          
-          # Differenza di potenza dall'ultimo invio
           diff: "{{ (final_kw | float(0) - last_sent_kw | float(0)) | abs }}"
           
-          # INVIAMO SOLO SE:
-          # 1. La variazione è > 0.4 kW (circa 2 Ampere)
-          # 2. OPPURE vogliamo spegnere/accendere (0.0 <-> 1.4)
-          # 3. OPPURE è cambiata la modalità
-          # 4. E sono passati almeno 30 secondi per non intasare la wallbox
           is_significant: "{{ diff >= 0.4 or (final_kw == 0 and last_sent_kw > 0) or (final_kw > 0 and last_sent_kw == 0) }}"
           is_mode_change: "{{ mode != states('input_text.ev_ultima_modalita_inviata') }}"
           
-          should_apply: "{{ trans_id > 0 and (is_significant or is_mode_change) and sec_dal_ultimo >= 30 }}"
+          should_apply: "{{ trans_id | int(0) > 0 and (is_significant or is_mode_change) and sec_dal_ultimo >= 30 }}"
+
+      # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
+      - service: system_log.write
+        data:
+          level: info
+          logger: ocpp_automation
+          message: >
+            [EV] {{ mode }} | Status: {{ wb_status }} | TransID: {{ trans_id }}
+            - Rete: {{ grid_kw|round(2) }}kW | Batt: {{ batt_pct }}% ({{ batt_kw|round(2) }}kW) | Auto: {{ ev_kw|round(2) }}kW
+            - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_amps }}A)
+            - Inviato? {{ 'SI' if should_apply else 'NO (Attesa 30s o Variazione Minore)' }}
 
       # Gestione Timer (Solo Surplus)
       - if:
@@ -200,46 +230,45 @@ automation:
             target:
               entity_id: timer.ev_off_delay
 
-      # Se dobbiamo applicare, scriviamo i log ed eseguiamo
+      # Se dobbiamo applicare, eseguiamo l'invio fisico
       - if:
           - condition: template
             value_template: "{{ should_apply }}"
         then:
-          - service: system_log.write
-            data:
-              level: info
-              logger: ocpp_automation
-              message: >
-                [EV] {{ mode }} | Invio Profilo: {{ final_kw }}kW ({{ eff_amps }}A) 
-                [Rete: {{ grid_kw }}kW, Precedente: {{ last_sent_kw }}kW]
-          
           - service: input_number.set_value
             target:
               entity_id: input_number.ev_ultima_potenza_inviata
             data:
               value: "{{ final_kw | float(0) }}"
+          
           - service: input_text.set_value
             target:
               entity_id: input_text.ev_ultima_modalita_inviata
             data:
               value: "{{ mode }}"
+          
           - service: input_datetime.set_datetime
             target:
               entity_id: input_datetime.ev_ultimo_invio_dt
             data:
               datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
-          - service: ocpp.set_charge_rate
-            data:
-              conn_id: 1
-              custom_profile:
-                transactionId: "{{ trans_id | int(0) }}"
-                chargingProfileId: 2
-                stackLevel: 2
-                chargingProfilePurpose: "TxProfile"
-                chargingProfileKind: "Relative"
-                chargingSchedule:
-                  chargingRateUnit: "A"
-                  chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
+          
+          - if:
+              - condition: template
+                value_template: "{{ not dry_run }}"
+            then:
+              - service: ocpp.set_charge_rate
+                data:
+                  conn_id: 1
+                  custom_profile:
+                    transactionId: "{{ trans_id | int(0) }}"
+                    chargingProfileId: 2
+                    stackLevel: 2
+                    chargingProfilePurpose: "TxProfile"
+                    chargingProfileKind: "Relative"
+                    chargingSchedule:
+                      chargingRateUnit: "A"
+                      chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
 
   - alias: "EV - Reset Profili OCPP"
     trigger:
@@ -249,4 +278,3 @@ automation:
       - service: ocpp.clear_profile
         data:
           device_id: "CH01"
-
