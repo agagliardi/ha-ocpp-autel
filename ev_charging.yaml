@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V3.1 - PROTEZIONE BATTERIA DINAMICA & FIX LOG
+# Configurazione OCPP Semplificata V3.2 - FIX DEADLOCK & ANTI-DISCONNESSIONE
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -149,7 +149,6 @@ automation:
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
           # Se batt_kw è negativo (scarica), registriamo quanta potenza l'auto sta "rubando" alla batteria.
-          # Questo valore deve essere ridotto dal calcolo totale per costringere l'auto a scendere.
           batt_drain_kw: "{{ batt_kw if batt_kw < 0 else 0.0 }}"
 
           # --- CALCOLO DISPONIBILITA' ---
@@ -157,7 +156,6 @@ automation:
           pot_disp: "{{ grid_kw + batt_drain_kw + ev_kw - maint_kw }}"
 
           # --- CALCOLO TARGET TEORICO ---
-          # Integriamo il controllo batteria anche nella Dinamica per evitare che "succhi" l'accumulo di casa
           target_teorico: >
             {% if mode == 'Fissa' %} 
               {{ max_carica_user }}
@@ -193,15 +191,28 @@ automation:
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
           eff_amps: "{{ final_amps | float if final_amps >= 6.0 else (1.0 if final_kw < 0.5 else 6.0) }}"
 
-          # --- VERIFICA INVIO ---
+          # --- VERIFICA INVIO (SISTEMA BI-DIREZIONALE ANTI-DEADLOCK) ---
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
-          diff: "{{ (final_kw | float(0) - last_sent_kw | float(0)) | abs }}"
           
-          is_significant: "{{ diff >= 0.4 or (final_kw == 0 and last_sent_kw > 0) or (final_kw > 0 and last_sent_kw == 0) }}"
+          # 1. Differenza rispetto a quanto memorizzato nell'ultimo invio
+          diff_sent: "{{ (final_kw | float(0) - last_sent_kw | float(0)) | abs }}"
+          # 2. Differenza rispetto all'assorbimento REALE attuale dell'auto (Rileva desincronizzazioni)
+          diff_real: "{{ (final_kw | float(0) - ev_kw | float(0)) | abs }}"
+          
+          # Condizioni di variazione significativa
+          is_significant: >
+            {{ diff_sent >= 0.4 or 
+               diff_real >= 0.8 or 
+               (final_kw == 0.0 and ev_kw > 0.5) or 
+               (final_kw >= 1.4 and ev_kw < 0.5 and last_sent_kw == 0.0) }}
+               
           is_mode_change: "{{ mode != states('input_text.ev_ultima_modalita_inviata') }}"
           
-          should_apply: "{{ trans_id | int(0) > 0 and (is_significant or is_mode_change) and sec_dal_ultimo >= 30 }}"
+          # Escludiamo il limite dei 30 secondi se dobbiamo SPEGNERE d'urgenza (evita blackout/scarica rapida)
+          bypass_delay: "{{ final_kw == 0.0 and ev_kw > 0.5 }}"
+          
+          should_apply: "{{ trans_id | int(0) > 0 and (is_significant or is_mode_change) and (sec_dal_ultimo >= 30 or bypass_delay) }}"
 
       # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
       - service: system_log.write
