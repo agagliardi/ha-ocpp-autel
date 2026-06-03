@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V3.2 - FIX DEADLOCK & ANTI-DISCONNESSIONE
+# Configurazione OCPP Semplificata V3.3 - FIX DEFINITIVO SERIALIZZAZIONE VARIABILI
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -148,23 +148,23 @@ automation:
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
-          # Se batt_kw è negativo (scarica), registriamo quanta potenza l'auto sta "rubando" alla batteria.
-          batt_drain_kw: "{{ batt_kw if batt_kw < 0 else 0.0 }}"
+          batt_drain_kw: "{{ batt_kw if batt_kw | float(0) < 0 else 0.0 }}"
 
           # --- CALCOLO DISPONIBILITA' ---
-          # Formula corretta: Rete + Batteria (se scarica, riduce la disponibilità) + Consumo auto - Mantenimento
-          pot_disp: "{{ grid_kw + batt_drain_kw + ev_kw - maint_kw }}"
+          pot_disp: "{{ grid_kw | float(0) + batt_drain_kw | float(0) + ev_kw | float(0) - maint_kw | float(0) }}"
 
           # --- CALCOLO TARGET TEORICO ---
           target_teorico: >
+            {% set p_disp = pot_disp | float(0) %}
+            {% set b_pct = batt_pct | float(0) %}
+            {% set m_batt = min_batt_surplus | float(20) %}
             {% if mode == 'Fissa' %} 
-              {{ max_carica_user }}
+              {{ max_carica_user | float(0) }}
             {% elif mode == 'Dinamica' %} 
-              {# Calcolo limite contatore considerando anche la batteria se si sta scaricando #}
-              {{ max_contatore - soglia_sic + grid_kw + batt_drain_kw + ev_kw }}
+              {{ (max_contatore | float(0)) - (soglia_sic | float(0)) + (grid_kw | float(0)) + (batt_drain_kw | float(0)) + (ev_kw | float(0)) }}
             {% elif mode == 'Surplus' %}
-              {% if pot_disp >= 1.3 or batt_pct >= min_batt_surplus %}
-                {{ pot_disp }}
+              {% if p_disp >= 1.3 or b_pct >= m_batt %}
+                {{ p_disp }}
               {% else %}
                 0.0
               {% endif %}
@@ -174,45 +174,47 @@ automation:
           
           # Logica Spegnimento (Solo Surplus, basata su Rete e stato della Batteria)
           wants_to_stop: >
+            {% set t_target = temp_target | float(0) %}
+            {% set g_kw = grid_kw | float(0) %}
+            {% set b_pct = batt_pct | float(0) %}
             {% if mode == 'Surplus' %}
-              {% if temp_target < 1.3 and (grid_kw < -0.4 or batt_pct < 15) %} true {% else %} false {% endif %}
+              {% if t_target < 1.3 and (g_kw < -0.4 or b_pct < 15) %} true {% else %} false {% endif %}
             {% else %} false {% endif %}
           
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(0) }}"
 
           # Calcolo Finale
           final_kw: >
-            {% if mode == 'Surplus' and wants_to_stop %}
-              {% if is_state('timer.ev_off_delay', 'active') %} {{ [last_sent_kw, 1.4]|max }} {% else %} 0.0 {% endif %}
+            {% set t_target = temp_target | float(0) %}
+            {% if mode == 'Surplus' and wants_to_stop | bool(false) %}
+              {% if is_state('timer.ev_off_delay', 'active') %} {{ [last_sent_kw | float(0), 1.4]|max }} {% else %} 0.0 {% endif %}
             {% else %}
-              {{ [temp_target | float(0), 1.4] | max | round(1) if temp_target >= 1.1 else 0.0 }}
+              {{ [t_target, 1.4] | max | round(1) if t_target >= 1.1 else 0.0 }}
             {% endif %}
 
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
-          eff_amps: "{{ final_amps | float if final_amps >= 6.0 else (1.0 if final_kw < 0.5 else 6.0) }}"
+          eff_amps: "{{ final_amps | float if final_amps | float(0) >= 6.0 else (1.0 if final_kw | float(0) < 0.5 else 6.0) }}"
 
           # --- VERIFICA INVIO (SISTEMA BI-DIREZIONALE ANTI-DEADLOCK) ---
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
           
-          # 1. Differenza rispetto a quanto memorizzato nell'ultimo invio
-          diff_sent: "{{ (final_kw | float(0) - last_sent_kw | float(0)) | abs }}"
-          # 2. Differenza rispetto all'assorbimento REALE attuale dell'auto (Rileva desincronizzazioni)
-          diff_real: "{{ (final_kw | float(0) - ev_kw | float(0)) | abs }}"
+          # Calcolo delle differenze con casting numerico esplicito
+          diff_sent: "{{ ((final_kw | float(0)) - (last_sent_kw | float(0))) | abs }}"
+          diff_real: "{{ ((final_kw | float(0)) - (ev_kw | float(0))) | abs }}"
           
           # Condizioni di variazione significativa
           is_significant: >
-            {{ diff_sent >= 0.4 or 
-               diff_real >= 0.8 or 
-               (final_kw == 0.0 and ev_kw > 0.5) or 
-               (final_kw >= 1.4 and ev_kw < 0.5 and last_sent_kw == 0.0) }}
+            {{ (diff_sent | float(0)) >= 0.4 or 
+               (diff_real | float(0)) >= 0.8 or 
+               ((final_kw | float(0)) == 0.0 and (ev_kw | float(0)) > 0.5) or 
+               ((final_kw | float(0)) >= 1.4 and (ev_kw | float(0)) < 0.5 and (last_sent_kw | float(0)) == 0.0) }}
                
           is_mode_change: "{{ mode != states('input_text.ev_ultima_modalita_inviata') }}"
           
-          # Escludiamo il limite dei 30 secondi se dobbiamo SPEGNERE d'urgenza (evita blackout/scarica rapida)
-          bypass_delay: "{{ final_kw == 0.0 and ev_kw > 0.5 }}"
+          bypass_delay: "{{ (final_kw | float(0)) == 0.0 and (ev_kw | float(0)) > 0.5 }}"
           
-          should_apply: "{{ trans_id | int(0) > 0 and (is_significant or is_mode_change) and (sec_dal_ultimo >= 30 or bypass_delay) }}"
+          should_apply: "{{ (trans_id | int(0)) > 0 and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
 
       # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
       - service: system_log.write
@@ -223,19 +225,19 @@ automation:
             [EV] {{ mode }} | Status: {{ wb_status }} | TransID: {{ trans_id }}
             - Rete: {{ grid_kw|round(2) }}kW | Batt: {{ batt_pct }}% ({{ batt_kw|round(2) }}kW) | Auto: {{ ev_kw|round(2) }}kW
             - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_amps }}A)
-            - Inviato? {{ 'SI' if should_apply else 'NO (Attesa 30s o Variazione Minore)' }}
+            - Inviato? {{ 'SI' if should_apply | bool(false) else 'NO (Attesa 30s o Variazione Minore)' }}
 
       # Gestione Timer (Solo Surplus)
       - if:
           - condition: template
-            value_template: "{{ mode == 'Surplus' and wants_to_stop and not is_state('timer.ev_off_delay', 'active') and last_sent_kw > 0.5 }}"
+            value_template: "{{ mode == 'Surplus' and wants_to_stop | bool(false) and not is_state('timer.ev_off_delay', 'active') and (last_sent_kw | float(0)) > 0.5 }}"
         then:
           - service: timer.start
             target:
               entity_id: timer.ev_off_delay
       - if:
           - condition: template
-            value_template: "{{ not wants_to_stop and is_state('timer.ev_off_delay', 'active') }}"
+            value_template: "{{ not wants_to_stop | bool(false) and is_state('timer.ev_off_delay', 'active') }}"
         then:
           - service: timer.cancel
             target:
@@ -244,7 +246,7 @@ automation:
       # Se dobbiamo applicare, eseguiamo l'invio fisico
       - if:
           - condition: template
-            value_template: "{{ should_apply }}"
+            value_template: "{{ should_apply | bool(false) }}"
         then:
           - service: input_number.set_value
             target:
@@ -266,7 +268,7 @@ automation:
           
           - if:
               - condition: template
-                value_template: "{{ not dry_run }}"
+                value_template: "{{ not dry_run | bool(false) }}"
             then:
               - service: ocpp.set_charge_rate
                 data:
