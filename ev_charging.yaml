@@ -1,5 +1,7 @@
-# Configurazione OCPP Semplificata V3.5 - SISTEMA DI SICUREZZA FAIL-SAFE SENSORI OFFLINE
+# Configurazione OCPP Semplificata V3.6 - OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
 # Sostituisce interamente le versioni precedenti.
+# OCPP >= 0.12: usa Session Current Limit per la modulazione della sessione.
+# Compatibilità temporanea: fallback al TxProfile raw se v0.12 non è ancora installato.
 
 logger:
   default: warning
@@ -124,6 +126,7 @@ automation:
           - input_number.ev_minimo_mantenimento
           - input_number.ev_capacita_wallbox
           - input_boolean.ev_dry_run_mode
+          - number.charger_session_current_limit
       - platform: event
         event_type: timer.finished
         event_data:
@@ -167,6 +170,8 @@ automation:
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.3) }}"
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
+          session_limit_entity_exists: "{{ states.number.charger_session_current_limit is defined }}"
+          session_limit_available: "{{ states.number.charger_session_current_limit is defined and states('number.charger_session_current_limit') != 'unavailable' }}"
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
           batt_drain_kw: "{{ batt_kw if batt_kw | float(0) < 0 else 0.0 }}"
@@ -223,7 +228,16 @@ automation:
             {% endif %}
 
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
-          eff_amps: "{{ final_amps | float if final_amps | float(0) >= 6.0 else (1.0 if final_kw | float(0) < 0.5 else 6.0) }}"
+          # OCPP v0.12 Session Current Limit lavora a passi interi di 1A.
+          # Arrotondiamo per difetto per non superare mai la potenza target.
+          eff_amps: >-
+            {% if final_amps | float(0) >= 6.0 %}
+              {{ final_amps | float(0) | round(0, 'floor') | int }}
+            {% elif final_kw | float(0) < 0.5 %}
+              1
+            {% else %}
+              6
+            {% endif %}
 
           # --- VERIFICA INVIO (SISTEMA BI-DIREZIONALE ANTI-DEADLOCK) ---
           last_sent_ts: "{{ as_timestamp(states('input_datetime.ev_ultimo_invio_dt')) | float(0) }}"
@@ -246,7 +260,8 @@ automation:
           
           bypass_delay: "{{ is_safety_reduction | bool(false) or (sensors_offline | bool(false)) }}"
           
-          should_apply: "{{ (trans_id | int(0)) > 0 and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
+          can_send_limit: "{{ session_limit_available | bool(false) if session_limit_entity_exists | bool(false) else (trans_id | int(0)) > 0 }}"
+          should_apply: "{{ can_send_limit | bool(false) and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
 
       # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
       - service: system_log.write
@@ -288,19 +303,33 @@ automation:
               - condition: template
                 value_template: "{{ not dry_run | bool(false) }}"
             then:
-              - service: ocpp.set_charge_rate
-                data:
-                  devid: "CH01"
-                  conn_id: 1
-                  custom_profile:
-                    transactionId: "{{ trans_id | int(0) }}"
-                    chargingProfileId: 2
-                    stackLevel: 2
-                    chargingProfilePurpose: "TxProfile"
-                    chargingProfileKind: "Relative"
-                    chargingSchedule:
-                      chargingRateUnit: "A"
-                      chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
+              # OCPP v0.12+: usa il nuovo limite di sessione. Gestisce internamente
+              # transactionId, profileId, stackLevel e rollback se il charger rifiuta.
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ session_limit_entity_exists | bool(false) }}"
+                    sequence:
+                      - service: number.set_value
+                        target:
+                          entity_id: number.charger_session_current_limit
+                        data:
+                          value: "{{ eff_amps | int }}"
+                default:
+                  # Compatibilità pre-v0.12 durante l'upgrade: vecchio TxProfile raw.
+                  - service: ocpp.set_charge_rate
+                    data:
+                      devid: "CH01"
+                      conn_id: 1
+                      custom_profile:
+                        transactionId: "{{ trans_id | int(0) }}"
+                        chargingProfileId: 2
+                        stackLevel: 2
+                        chargingProfilePurpose: "TxProfile"
+                        chargingProfileKind: "Relative"
+                        chargingSchedule:
+                          chargingRateUnit: "A"
+                          chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
               - service: input_number.set_value
                 target:
                   entity_id: input_number.ev_ultima_potenza_inviata
