@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V3.4 - SISTEMA DI SICUREZZA FAIL-SAFE SENSORI OFFLINE
+# Configurazione OCPP Semplificata V3.5 - SISTEMA DI SICUREZZA FAIL-SAFE SENSORI OFFLINE
 # Sostituisce interamente le versioni precedenti.
 
 logger:
@@ -112,8 +112,22 @@ automation:
         entity_id: 
           - sensor.inverter_grid_power
           - sensor.inverter_battery_power
+          - sensor.inverter_battery
           - sensor.charger_power_active_import
+          - sensor.charger_transaction_id
+          - sensor.ae0007a1gn5c008960_transaction_id
           - input_select.ev_modalita
+          - input_number.ev_max_contatore
+          - input_number.ev_soglia_sicurezza
+          - input_number.ev_massima_carica
+          - input_number.ev_minima_batteria_surplus
+          - input_number.ev_minimo_mantenimento
+          - input_number.ev_capacita_wallbox
+          - input_boolean.ev_dry_run_mode
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.ev_off_delay
     action:
       - variables:
           # --- RILEVAMENTO GRADO DI SALUTE DELLA RETE (FAIL-SAFE) ---
@@ -194,12 +208,16 @@ automation:
             {% else %} false {% endif %}
           
           last_sent_kw: "{{ states('input_number.ev_ultima_potenza_inviata') | float(0) }}"
+          off_delay_expired: "{{ trigger.platform == 'event' and trigger.event.event_type == 'timer.finished' and trigger.event.data.entity_id == 'timer.ev_off_delay' }}"
 
           # Calcolo Finale
           final_kw: >
             {% set t_target = temp_target | float(0) %}
             {% if mode == 'Surplus' and wants_to_stop | bool(false) %}
-              {% if is_state('timer.ev_off_delay', 'active') %} {{ [last_sent_kw | float(0), 1.4]|max }} {% else %} 0.0 {% endif %}
+              {% if off_delay_expired | bool(false) %} 0.0
+              {% elif (last_sent_kw | float(0)) > 0.5 %} {{ [last_sent_kw | float(0), 1.4]|max }}
+              {% else %} {{ [ev_kw | float(0), 1.4]|max }}
+              {% endif %}
             {% else %}
               {{ [t_target, 1.4] | max | round(1) if t_target >= 1.1 else 0.0 }}
             {% endif %}
@@ -212,8 +230,8 @@ automation:
           sec_dal_ultimo: "{{ (as_timestamp(now()) - last_sent_ts) | int }}"
           
           # Calcolo delle differenze con casting numerico esplicito
-          diff_sent: "{{ ((final_kw | float(0)) - (last_sent_kw | float(0))) | abs }}"
-          diff_real: "{{ ((final_kw | float(0)) - (ev_kw | float(0))) | abs }}"
+          diff_sent: "{{ (((final_kw | float(0)) - (last_sent_kw | float(0))) | abs) | round(1) }}"
+          diff_real: "{{ (((final_kw | float(0)) - (ev_kw | float(0))) | abs) | round(1) }}"
           
           # Condizioni di variazione significativa (aggiunta forzatura se i sensori vanno offline)
           is_significant: >
@@ -224,8 +242,9 @@ automation:
                (sensors_offline | bool(false) and (last_sent_kw | float(0)) > 1.4) }}
                
           is_mode_change: "{{ mode != states('input_text.ev_ultima_modalita_inviata') }}"
+          is_safety_reduction: "{{ (final_kw | float(0)) < ((last_sent_kw | float(0)) - 0.1) or (final_kw | float(0)) < ((ev_kw | float(0)) - 0.1) }}"
           
-          bypass_delay: "{{ (final_kw | float(0)) == 0.0 and (ev_kw | float(0)) > 0.5 or (sensors_offline | bool(false)) }}"
+          bypass_delay: "{{ is_safety_reduction | bool(false) or (sensors_offline | bool(false)) }}"
           
           should_apply: "{{ (trans_id | int(0)) > 0 and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
 
@@ -241,13 +260,13 @@ automation:
               [EV] {{ mode }} | Status: {{ wb_status }} | TransID: {{ trans_id }}
               - Rete: {{ grid_kw|round(2) }}kW | Batt: {{ batt_pct }}% ({{ batt_kw|round(2) }}kW) | Auto: {{ ev_kw|round(2) }}kW
               - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_amps }}A)
-              - Inviato? {{ 'SI' if should_apply | bool(false) else 'NO (Attesa 30s o Variazione Minore)' }}
+              - Inviato? {{ 'DRY-RUN' if should_apply | bool(false) and dry_run | bool(false) else ('SI' if should_apply | bool(false) else 'NO (Attesa 30s o Variazione Minore)') }}
             {% endif %}
 
       # Gestione Timer (Solo Surplus)
       - if:
           - condition: template
-            value_template: "{{ mode == 'Surplus' and wants_to_stop | bool(false) and not is_state('timer.ev_off_delay', 'active') and (last_sent_kw | float(0)) > 0.5 }}"
+            value_template: "{{ mode == 'Surplus' and wants_to_stop | bool(false) and not off_delay_expired | bool(false) and not is_state('timer.ev_off_delay', 'active') and ((last_sent_kw | float(0)) > 0.5 or (ev_kw | float(0)) > 0.5) }}"
         then:
           - service: timer.start
             target:
@@ -265,30 +284,13 @@ automation:
           - condition: template
             value_template: "{{ should_apply | bool(false) }}"
         then:
-          - service: input_number.set_value
-            target:
-              entity_id: input_number.ev_ultima_potenza_inviata
-            data:
-              value: "{{ final_kw | float(0) }}"
-          
-          - service: input_text.set_value
-            target:
-              entity_id: input_text.ev_ultima_modalita_inviata
-            data:
-              value: "{{ mode }}"
-          
-          - service: input_datetime.set_datetime
-            target:
-              entity_id: input_datetime.ev_ultimo_invio_dt
-            data:
-              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
-          
           - if:
               - condition: template
                 value_template: "{{ not dry_run | bool(false) }}"
             then:
               - service: ocpp.set_charge_rate
                 data:
+                  devid: "CH01"
                   conn_id: 1
                   custom_profile:
                     transactionId: "{{ trans_id | int(0) }}"
@@ -299,6 +301,23 @@ automation:
                     chargingSchedule:
                       chargingRateUnit: "A"
                       chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.ev_ultima_potenza_inviata
+                data:
+                  value: "{{ final_kw | float(0) }}"
+              
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.ev_ultima_modalita_inviata
+                data:
+                  value: "{{ mode }}"
+              
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.ev_ultimo_invio_dt
+                data:
+                  datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
 
   - alias: "EV - Reset Profili OCPP"
     trigger:
@@ -307,4 +326,5 @@ automation:
     action:
       - service: ocpp.clear_profile
         data:
-          device_id: "CH01"
+          devid: "CH01"
+      - delay: "00:00:05"
