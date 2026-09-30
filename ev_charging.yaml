@@ -170,8 +170,8 @@ automation:
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.3) }}"
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
-          session_limit_entity_exists: "{{ states.number.charger_session_current_limit is not none }}"
-          session_limit_available: "{{ states.number.charger_session_current_limit is not none and states('number.charger_session_current_limit') != 'unavailable' }}"
+          session_limit_entity_exists: "{{ states.number.charger_session_current_limit is defined }}"
+          session_limit_available: "{{ states.number.charger_session_current_limit is defined and states('number.charger_session_current_limit') != 'unavailable' }}"
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
           batt_drain_kw: "{{ batt_kw if batt_kw | float(0) < 0 else 0.0 }}"
