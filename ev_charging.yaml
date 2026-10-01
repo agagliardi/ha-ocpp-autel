@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V3.6 - OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
+# Configurazione OCPP Semplificata V3.7 - OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
 # Sostituisce interamente le versioni precedenti.
 # OCPP >= 0.12: usa Session Current Limit per la modulazione della sessione.
 # Compatibilità temporanea: fallback al TxProfile raw se v0.12 non è ancora installato.
@@ -108,7 +108,10 @@ timer:
 automation:
   - alias: "EV - Logica di Ricarica Principale"
     id: ev_logica_principale
-    mode: restart 
+    # Le scritture del Session Current Limit richiedono più round-trip OCPP.
+    # Non interrompere una richiesta in corso quando arrivano nuovi campioni.
+    mode: single
+    max_exceeded: silent
     trigger:
       - platform: state
         entity_id: 
@@ -116,6 +119,7 @@ automation:
           - sensor.inverter_battery_power
           - sensor.inverter_battery
           - sensor.charger_power_active_import
+          - sensor.charger_status_connector
           - sensor.charger_transaction_id
           - sensor.ae0007a1gn5c008960_transaction_id
           - input_select.ev_modalita
@@ -126,7 +130,8 @@ automation:
           - input_number.ev_minimo_mantenimento
           - input_number.ev_capacita_wallbox
           - input_boolean.ev_dry_run_mode
-          - number.charger_session_current_limit
+      - platform: homeassistant
+        event: start
       - platform: event
         event_type: timer.finished
         event_data:
