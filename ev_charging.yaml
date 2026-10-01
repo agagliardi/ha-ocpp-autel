@@ -1,7 +1,6 @@
-# Configurazione OCPP Semplificata V3.7 - OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
+# Configurazione OCPP Semplificata V3.8 - AUTEL OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
 # Sostituisce interamente le versioni precedenti.
-# OCPP >= 0.12: usa Session Current Limit per la modulazione della sessione.
-# Compatibilità temporanea: fallback al TxProfile raw se v0.12 non è ancora installato.
+# Autel MaxiCharger: usa TxProfile raw in W, stackLevel 1.
 
 logger:
   default: warning
@@ -108,8 +107,6 @@ timer:
 automation:
   - alias: "EV - Logica di Ricarica Principale"
     id: ev_logica_principale
-    # Le scritture del Session Current Limit richiedono più round-trip OCPP.
-    # Non interrompere una richiesta in corso quando arrivano nuovi campioni.
     mode: single
     max_exceeded: silent
     trigger:
@@ -175,8 +172,6 @@ automation:
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.3) }}"
           max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
-          session_limit_entity_exists: "{{ states.number.charger_session_current_limit is defined }}"
-          session_limit_available: "{{ states.number.charger_session_current_limit is defined and states('number.charger_session_current_limit') != 'unavailable' }}"
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
           batt_drain_kw: "{{ batt_kw if batt_kw | float(0) < 0 else 0.0 }}"
@@ -233,15 +228,13 @@ automation:
             {% endif %}
 
           final_amps: "{{ ((final_kw | float(0) * 1000) / 230) | round(1) }}"
-          # OCPP v0.12 Session Current Limit lavora a passi interi di 1A.
-          # Arrotondiamo per difetto per non superare mai la potenza target.
-          eff_amps: >-
-            {% if final_amps | float(0) >= 6.0 %}
-              {{ final_amps | float(0) | round(0, 'floor') | int }}
-            {% elif final_kw | float(0) < 0.5 %}
-              1
+          # La Autel dichiara ChargingScheduleAllowedChargingRateUnit=Power.
+          # Usiamo quindi direttamente Watt evitando la conversione del Session Current Limit.
+          eff_watts: >-
+            {% if final_kw | float(0) < 0.5 %}
+              230
             {% else %}
-              6
+              {{ ([final_kw | float(0), 1.4] | max * 1000) | round(0) | int }}
             {% endif %}
 
           # --- VERIFICA INVIO (SISTEMA BI-DIREZIONALE ANTI-DEADLOCK) ---
@@ -265,7 +258,7 @@ automation:
           
           bypass_delay: "{{ is_safety_reduction | bool(false) or (sensors_offline | bool(false)) }}"
           
-          can_send_limit: "{{ session_limit_available | bool(false) if session_limit_entity_exists | bool(false) else (trans_id | int(0)) > 0 }}"
+          can_send_limit: "{{ (trans_id | int(0)) > 0 }}"
           should_apply: "{{ can_send_limit | bool(false) and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
 
       # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
@@ -275,11 +268,11 @@ automation:
           logger: ocpp_automation
           message: >
             {% if sensors_offline | bool(false) %}
-              [EV] !!! SENSORI INVERTER OFFLINE (Internet assente?) !!! Attivata protezione di sicurezza. Modalità: {{ mode }} | Status: {{ wb_status }} | Target forzato a {{ final_kw }}kW ({{ eff_amps }}A). Inviato? {{ 'SI' if should_apply | bool(false) else 'NO' }}
+              [EV] !!! SENSORI INVERTER OFFLINE (Internet assente?) !!! Attivata protezione di sicurezza. Modalità: {{ mode }} | Status: {{ wb_status }} | Target forzato a {{ final_kw }}kW ({{ eff_watts }}W). Inviato? {{ 'SI' if should_apply | bool(false) else 'NO' }}
             {% else %}
               [EV] {{ mode }} | Status: {{ wb_status }} | TransID: {{ trans_id }}
               - Rete: {{ grid_kw|round(2) }}kW | Batt: {{ batt_pct }}% ({{ batt_kw|round(2) }}kW) | Auto: {{ ev_kw|round(2) }}kW
-              - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_amps }}A)
+              - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_watts }}W / {{ final_amps }}A eq.)
               - Inviato? {{ 'DRY-RUN' if should_apply | bool(false) and dry_run | bool(false) else ('SI' if should_apply | bool(false) else 'NO (Attesa 30s o Variazione Minore)') }}
             {% endif %}
 
@@ -308,33 +301,22 @@ automation:
               - condition: template
                 value_template: "{{ not dry_run | bool(false) }}"
             then:
-              # OCPP v0.12+: usa il nuovo limite di sessione. Gestisce internamente
-              # transactionId, profileId, stackLevel e rollback se il charger rifiuta.
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ session_limit_entity_exists | bool(false) }}"
-                    sequence:
-                      - service: number.set_value
-                        target:
-                          entity_id: number.charger_session_current_limit
-                        data:
-                          value: "{{ eff_amps | int }}"
-                default:
-                  # Compatibilità pre-v0.12 durante l'upgrade: vecchio TxProfile raw.
-                  - service: ocpp.set_charge_rate
-                    data:
-                      devid: "CH01"
-                      conn_id: 1
-                      custom_profile:
-                        transactionId: "{{ trans_id | int(0) }}"
-                        chargingProfileId: 2
-                        stackLevel: 2
-                        chargingProfilePurpose: "TxProfile"
-                        chargingProfileKind: "Relative"
-                        chargingSchedule:
-                          chargingRateUnit: "A"
-                          chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_amps | float(1.0) }}"}]
+              # Autel + OCPP v0.12: il Session Current Limit va in timeout/cambia
+              # transazione. Usiamo un TxProfile raw con le capability reali del charger:
+              # Power (W) e ChargeProfileMaxStackLevel=1.
+              - service: ocpp.set_charge_rate
+                data:
+                  devid: "CH01"
+                  conn_id: 1
+                  custom_profile:
+                    transactionId: "{{ trans_id | int(0) }}"
+                    chargingProfileId: 3101
+                    stackLevel: 1
+                    chargingProfilePurpose: "TxProfile"
+                    chargingProfileKind: "Relative"
+                    chargingSchedule:
+                      chargingRateUnit: "W"
+                      chargingSchedulePeriod: [{startPeriod: 0, limit: "{{ eff_watts | int }}"}]
               - service: input_number.set_value
                 target:
                   entity_id: input_number.ev_ultima_potenza_inviata
