@@ -74,7 +74,7 @@ views:
             icon: mdi:transmission-tower
 
           - type: tile
-            entity: sensor.ev_grid_headroom_kw
+            entity: sensor.ev_margine_rete_kw
             name: Margine rete
             icon: mdi:transmission-tower
             grid_options:
