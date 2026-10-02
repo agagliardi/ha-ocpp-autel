@@ -1,0 +1,292 @@
+views:
+  - title: Charging
+    path: charging
+    icon: mdi:ev-station
+    type: sections
+    max_columns: 4
+    dense_section_placement: true
+    sections:
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: EV Charging
+            heading_style: title
+            icon: mdi:ev-station
+            badges:
+              - type: entity
+                entity: sensor.charger_status_connector
+                show_state: true
+                show_icon: true
+              - type: entity
+                entity: input_select.ev_modalita
+                show_state: true
+                show_icon: true
+
+          - type: gauge
+            entity: input_number.ev_target_calcolato
+            name: Disponibile / Target
+            min: 0
+            max: 7
+            needle: true
+            severity:
+              red: 0
+              yellow: 1.4
+              green: 3
+            grid_options:
+              columns: 4
+              rows: 3
+
+          - type: gauge
+            entity: input_number.ev_ultima_potenza_inviata
+            name: Richiesto alla wallbox
+            min: 0
+            max: 7
+            needle: true
+            severity:
+              red: 0
+              yellow: 1.4
+              green: 3
+            grid_options:
+              columns: 4
+              rows: 3
+
+          - type: gauge
+            entity: sensor.ev_wallbox_power_kw
+            name: Wallbox effettiva
+            min: 0
+            max: 7
+            needle: true
+            severity:
+              red: 0
+              yellow: 1.4
+              green: 3
+            grid_options:
+              columns: 4
+              rows: 3
+
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Energia disponibile
+            heading_style: subtitle
+            icon: mdi:transmission-tower
+
+          - type: tile
+            entity: sensor.ev_grid_headroom_kw
+            name: Margine rete
+            icon: mdi:transmission-tower
+            grid_options:
+              columns: 3
+
+          - type: tile
+            entity: sensor.ev_grid_power_kw
+            name: Rete
+            icon: mdi:transmission-tower
+            grid_options:
+              columns: 3
+
+          - type: tile
+            entity: sensor.ev_pv_power_kw
+            name: Fotovoltaico
+            icon: mdi:solar-power
+            grid_options:
+              columns: 3
+
+          - type: tile
+            entity: sensor.ev_battery_power_kw
+            name: Batteria
+            icon: mdi:battery-charging
+            grid_options:
+              columns: 3
+
+          - type: tile
+            entity: sensor.inverter_battery
+            name: SOC batteria
+            icon: mdi:battery
+            grid_options:
+              columns: 3
+
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Ultima ora
+            heading_style: subtitle
+            icon: mdi:chart-line
+
+          - type: history-graph
+            title: Target, richiesta e potenza reale
+            hours_to_show: 1
+            entities:
+              - entity: input_number.ev_target_calcolato
+                name: Target
+              - entity: input_number.ev_ultima_potenza_inviata
+                name: Richiesto
+              - entity: sensor.ev_wallbox_power_kw
+                name: Wallbox
+              - entity: sensor.ev_grid_power_kw
+                name: Rete
+            grid_options:
+              columns: full
+
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Comandi
+            heading_style: subtitle
+            icon: mdi:tune
+
+          - type: tile
+            entity: input_select.ev_modalita
+            name: Modalità
+            features:
+              - type: select-options
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_number.ev_massima_carica
+            name: Massima carica EV
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_boolean.ev_dry_run_mode
+            name: Dry Run
+            icon: mdi:test-tube
+            features:
+              - type: toggle
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: button
+            entity: input_button.ev_reset_profili
+            name: Reset profili OCPP
+            icon: mdi:restart-alert
+            show_state: false
+            tap_action:
+              action: perform-action
+              perform_action: input_button.press
+              target:
+                entity_id: input_button.ev_reset_profili
+              confirmation:
+                text: Confermi il reset dei profili OCPP?
+            grid_options:
+              columns: 4
+              rows: 2
+
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Soglie
+            heading_style: subtitle
+            icon: mdi:tune-variant
+
+          - type: tile
+            entity: input_number.ev_max_contatore
+            name: Limite contatore
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_number.ev_soglia_sicurezza
+            name: Margine sicurezza
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_number.ev_capacita_wallbox
+            name: Capacità wallbox
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_number.ev_minima_batteria_surplus
+            name: SOC minimo Surplus
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: tile
+            entity: input_number.ev_minimo_mantenimento
+            name: Mantenimento batteria
+            features:
+              - type: numeric-input
+                style: buttons
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Diagnostica
+            heading_style: subtitle
+            icon: mdi:text-box-search
+
+          - type: tile
+            entity: input_boolean.ev_show_logs
+            name: Mostra ultimi 30 log
+            icon: mdi:text-box-search-outline
+            features:
+              - type: toggle
+            features_position: bottom
+            grid_options:
+              columns: 4
+              rows: 2
+
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_boolean.ev_show_logs
+                state: "on"
+            card:
+              type: markdown
+              title: Ultimi 30 eventi EV
+              entity_id: sensor.ev_charging_log
+              content: |
+                {% set entries = state_attr('sensor.ev_charging_log', 'entries') or [] %}
+                {% if entries | length == 0 %}
+                Nessun evento EV registrato.
+                {% else %}
+                {% for entry in entries %}
+                `{{ entry }}`
+
+                {% endfor %}
+                {% endif %}
+            grid_options:
+              columns: full
