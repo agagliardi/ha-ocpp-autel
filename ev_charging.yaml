@@ -1,4 +1,4 @@
-# Configurazione OCPP Semplificata V3.8 - AUTEL OCPP v0.12 + FAIL-SAFE SENSORI OFFLINE
+# Configurazione OCPP Semplificata V3.9 - AUTEL OCPP v0.12 + DASHBOARD DIAGNOSTICA
 # Sostituisce interamente le versioni precedenti.
 # Autel MaxiCharger: usa TxProfile raw in W, stackLevel 1.
 
@@ -6,6 +6,61 @@ logger:
   default: warning
   logs:
     ocpp_automation: info
+
+template:
+  - sensor:
+      - name: "EV Grid Power kW"
+        unique_id: ev_grid_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.inverter_grid_power') | float(0) / 1000) | round(2) }}"
+
+      - name: "EV PV Power kW"
+        unique_id: ev_pv_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.inverter_pv_power') | float(0) / 1000) | round(2) }}"
+
+      - name: "EV Battery Power kW"
+        unique_id: ev_battery_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.inverter_battery_power') | float(0) / 1000) | round(2) }}"
+
+      - name: "EV Wallbox Power kW"
+        unique_id: ev_wallbox_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set p = states('sensor.charger_power_active_import') | float(0) %}
+          {{ (p / 1000 if p > 50 else p) | round(2) }}
+
+      - name: "EV Margine Rete kW"
+        unique_id: ev_grid_headroom_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set grid = states('sensor.inverter_grid_power') | float(0) / 1000 %}
+          {% set max_grid = states('input_number.ev_max_contatore') | float(6.3) %}
+          {% set safety = states('input_number.ev_soglia_sicurezza') | float(0.4) %}
+          {{ (max_grid - safety + grid) | round(2) }}
+
+  - trigger:
+      - platform: event
+        event_type: ev_charging_log
+    sensor:
+      - name: "EV Charging Log"
+        unique_id: ev_charging_log
+        state: "{{ trigger.event.data.timestamp | default(now().strftime('%Y-%m-%d %H:%M:%S')) }}"
+        attributes:
+          entries: >-
+            {% set previous = this.attributes.get('entries', []) %}
+            {{ ([trigger.event.data.message] + previous)[:30] }}
 
 # ----------------------------------------------------------------------------
 # 1. HELPER E CONFIGURAZIONI
@@ -61,7 +116,13 @@ input_number:
 
   ev_ultima_potenza_inviata:
     name: "Ultima Potenza Inviata (kW)"
-    initial: 0.0
+    min: 0.0
+    max: 22.0
+    step: 0.1
+    unit_of_measurement: kW
+
+  ev_target_calcolato:
+    name: "Target Calcolato EV (kW)"
     min: 0.0
     max: 22.0
     step: 0.1
@@ -90,6 +151,10 @@ input_text:
 input_boolean:
   ev_dry_run_mode:
     name: "Modalità Test (Dry-Run)"
+    initial: false
+
+  ev_show_logs:
+    name: "Mostra Log EV"
     initial: false
 
 input_button:
@@ -261,6 +326,24 @@ automation:
           can_send_limit: "{{ (trans_id | int(0)) > 0 }}"
           should_apply: "{{ can_send_limit | bool(false) and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
 
+      # Target attuale del controller, aggiornato anche quando il debounce impedisce l'invio
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.ev_target_calcolato
+        data:
+          value: "{{ final_kw | float(0) }}"
+
+      # Coda diagnostica EV: ultimi 30 eventi, mostrabile dalla dashboard
+      - event: ev_charging_log
+        event_data:
+          timestamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          message: >-
+            {{ now().strftime('%H:%M:%S') }} | {{ mode }} | {{ wb_status }} |
+            Rete {{ grid_kw|round(2) }} kW | Batt {{ batt_pct|round(0) }}% {{ batt_kw|round(2) }} kW |
+            EV {{ ev_kw|round(2) }} kW | Target {{ final_kw|round(1) }} kW |
+            Richiesto {{ last_sent_kw|round(1) }} kW |
+            {{ 'DRY-RUN' if should_apply | bool(false) and dry_run | bool(false) else ('SEND' if should_apply | bool(false) else 'HOLD') }}
+
       # --- LOGGING COMPLETO AD OGNI TRIGGER (Sempre Visibile) ---
       - service: system_log.write
         data:
@@ -340,6 +423,10 @@ automation:
       - platform: state
         entity_id: input_button.ev_reset_profili
     action:
+      - event: ev_charging_log
+        event_data:
+          timestamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          message: "{{ now().strftime('%H:%M:%S') }} | RESET | Pulizia profili OCPP richiesta"
       - service: ocpp.clear_profile
         data:
           devid: "CH01"
