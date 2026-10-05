@@ -1,6 +1,8 @@
-# Configurazione OCPP Semplificata V3.9 - AUTEL OCPP v0.12 + DASHBOARD DIAGNOSTICA
+# Configurazione OCPP Semplificata V4.0 - AUTEL OCPP v0.12 + POWER ENVELOPE
 # Sostituisce interamente le versioni precedenti.
 # Autel MaxiCharger: usa TxProfile raw in W, stackLevel 1.
+# Power envelope: rete 6.6 kW nominali disponibili, 0.4 kW margine (6.2 kW operativi),
+# target EV 7.0 kW, hard cap wallbox 7.2 kW. La scarica batteria non aumenta il target EV.
 
 logger:
   default: warning
@@ -46,7 +48,7 @@ template:
         state_class: measurement
         state: >-
           {% set grid = states('sensor.inverter_grid_power') | float(0) / 1000 %}
-          {% set max_grid = states('input_number.ev_max_contatore') | float(6.3) %}
+          {% set max_grid = states('input_number.ev_max_contatore') | float(6.6) %}
           {% set safety = states('input_number.ev_soglia_sicurezza') | float(0.4) %}
           {{ (max_grid - safety + grid) | round(2) }}
 
@@ -68,7 +70,7 @@ template:
 input_number:
   ev_max_contatore:
     name: "Massimo Contatore (kW)"
-    initial: 6.3
+    initial: 6.6
     min: 1.4
     max: 10.0
     step: 0.1
@@ -84,7 +86,7 @@ input_number:
 
   ev_massima_carica:
     name: "Massima Carica (kW)"
-    initial: 6.0
+    initial: 7.0
     min: 1.4
     max: 11.0
     step: 0.1
@@ -108,7 +110,7 @@ input_number:
 
   ev_capacita_wallbox:
     name: "Capacita' Massima Wallbox (kW)"
-    initial: 7.0
+    initial: 7.2
     min: 1.4
     max: 22.0
     step: 0.1
@@ -219,6 +221,7 @@ automation:
           raw_ev: "{{ states('sensor.charger_power_active_import') | float(0) }}"
           ev_kw: "{{ raw_ev / 1000 if raw_ev > 50 else raw_ev }}" 
           wb_status: "{{ states('sensor.charger_status_connector') | default(states('sensor.charger_status') | default('Sconosciuto')) }}"
+          is_charging: "{{ wb_status == 'Charging' }}"
 
           # Rilevamento automatico e robusto del Transaction ID
           trans_id: >
@@ -230,12 +233,12 @@ automation:
 
           # --- CONFIGURAZIONI ---
           mode: "{{ states('input_select.ev_modalita') }}"
-          max_contatore: "{{ states('input_number.ev_max_contatore') | float(6.3) }}"
+          max_contatore: "{{ states('input_number.ev_max_contatore') | float(6.6) }}"
           soglia_sic: "{{ states('input_number.ev_soglia_sicurezza') | float(0.4) }}"
-          max_carica_user: "{{ states('input_number.ev_massima_carica') | float(6.0) }}"
+          max_carica_user: "{{ states('input_number.ev_massima_carica') | float(7.0) }}"
           min_batt_surplus: "{{ states('input_number.ev_minima_batteria_surplus') | float(20) }}"
           maint_kw: "{{ states('input_number.ev_minimo_mantenimento') | float(0.3) }}"
-          max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.0) }}"
+          max_wallbox: "{{ states('input_number.ev_capacita_wallbox') | float(7.2) }}"
           dry_run: "{{ is_state('input_boolean.ev_dry_run_mode', 'on') }}"
           
           # --- CONTROLLO SCARICA BATTERIA (POLMONE) ---
@@ -286,8 +289,16 @@ automation:
           final_kw: >
             {% set t_target = temp_target | float(0) %}
             {% if mode == 'Surplus' and wants_to_stop | bool(false) %}
-              {% if off_delay_expired | bool(false) %} 0.0
-              {% else %} 1.4
+              {# In assenza di surplus: resta al minimo solo durante il timer.
+                 Una volta inviato 0, rimani a 0 finché il surplus non ritorna. #}
+              {% if off_delay_expired | bool(false) %}
+                0.0
+              {% elif is_state('timer.ev_off_delay', 'active') %}
+                1.4
+              {% elif (last_sent_kw | float(0)) > 0.5 or (ev_kw | float(0)) > 0.5 %}
+                1.4
+              {% else %}
+                0.0
               {% endif %}
             {% else %}
               {{ [t_target, 1.4] | max | round(1) if t_target >= 1.1 else 0.0 }}
@@ -311,11 +322,12 @@ automation:
           diff_sent: "{{ (((final_kw | float(0)) - (last_sent_kw | float(0))) | abs) | round(1) }}"
           diff_real: "{{ (((final_kw | float(0)) - (ev_kw | float(0))) | abs) | round(1) }}"
           
-          # Condizioni di variazione significativa (aggiunta forzatura se i sensori vanno offline)
+          # Evita resend inutili quando la wallbox e' sospesa:
+          # la divergenza tra target e potenza reale conta solo durante Charging.
           is_significant: >
-            {{ (diff_sent | float(0)) >= 0.4 or 
-               (diff_real | float(0)) >= 0.8 or 
-               ((final_kw | float(0)) == 0.0 and (ev_kw | float(0)) > 0.5) or 
+            {{ (diff_sent | float(0)) >= 0.4 or
+               ((is_charging | bool(false)) and (diff_real | float(0)) >= 0.8) or
+               ((final_kw | float(0)) == 0.0 and (ev_kw | float(0)) > 0.5) or
                ((final_kw | float(0)) >= 1.4 and (ev_kw | float(0)) < 0.5 and (last_sent_kw | float(0)) == 0.0) or
                (sensors_offline | bool(false) and (last_sent_kw | float(0)) > 1.4) }}
                
@@ -325,7 +337,9 @@ automation:
           bypass_delay: "{{ is_safety_reduction | bool(false) or (sensors_offline | bool(false)) }}"
           
           can_send_limit: "{{ (trans_id | int(0)) > 0 }}"
-          should_apply: "{{ can_send_limit | bool(false) and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 30 or bypass_delay | bool(false)) }}"
+          # Aumenti/correzioni non di sicurezza: max un invio ogni 45 s.
+          # Riduzioni e fail-safe bypassano il debounce.
+          should_apply: "{{ can_send_limit | bool(false) and (is_significant | bool(false) or is_mode_change | bool(false)) and ((sec_dal_ultimo | int(0)) >= 45 or bypass_delay | bool(false)) }}"
 
       # Target attuale del controller, aggiornato anche quando il debounce impedisce l'invio
       - service: input_number.set_value
@@ -357,7 +371,7 @@ automation:
               [EV] {{ mode }} | Status: {{ wb_status }} | TransID: {{ trans_id }}
               - Rete: {{ grid_kw|round(2) }}kW | Batt: {{ batt_pct }}% ({{ batt_kw|round(2) }}kW) | Auto: {{ ev_kw|round(2) }}kW
               - Disponibile: {{ pot_disp|round(2) }}kW -> Target: {{ final_kw }}kW ({{ eff_watts }}W / {{ final_amps }}A eq.)
-              - Inviato? {{ 'DRY-RUN' if should_apply | bool(false) and dry_run | bool(false) else ('SI' if should_apply | bool(false) else 'NO (Attesa 30s o Variazione Minore)') }}
+              - Inviato? {{ 'DRY-RUN' if should_apply | bool(false) and dry_run | bool(false) else ('SI' if should_apply | bool(false) else 'NO (Attesa 45s o Variazione Minore)') }}
             {% endif %}
 
       # Gestione Timer (Solo Surplus)
