@@ -286,8 +286,16 @@ automation:
           final_kw: >
             {% set t_target = temp_target | float(0) %}
             {% if mode == 'Surplus' and wants_to_stop | bool(false) %}
-              {% if off_delay_expired | bool(false) %} 0.0
-              {% else %} 1.4
+              {# In assenza di surplus: resta al minimo solo durante il timer.
+                 Una volta inviato 0, rimani a 0 finché il surplus non ritorna. #}
+              {% if off_delay_expired | bool(false) %}
+                0.0
+              {% elif is_state('timer.ev_off_delay', 'active') %}
+                1.4
+              {% elif (last_sent_kw | float(0)) > 0.5 or (ev_kw | float(0)) > 0.5 %}
+                1.4
+              {% else %}
+                0.0
               {% endif %}
             {% else %}
               {{ [t_target, 1.4] | max | round(1) if t_target >= 1.1 else 0.0 }}
